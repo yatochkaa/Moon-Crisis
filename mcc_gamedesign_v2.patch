@@ -1,0 +1,1983 @@
+diff --git a/PROJECT_CONTEXT.md b/PROJECT_CONTEXT.md
+index 907793a..da1c725 100644
+--- a/PROJECT_CONTEXT.md
++++ b/PROJECT_CONTEXT.md
+@@ -123,3 +123,16 @@ pnpm audit
+ 3. Многодневные доставки и статус `delivering` во времени.
+ 4. Переход на PostgreSQL + оптимистичные блокировки.
+ 5. CI-пайплайн и (при необходимости) аутентификация.
++
++
++---
++
++## Game Design v2 — Итерация 1
++
++Первая итерация Game Design v2 меняет доменную модель: разделение
++кредитов (`balanceCredits`/`earnedCredits`) и батареи
++(`batteryCharge`/`batteryCapacity`), уровни улучшений роверов и `RoverStats`,
++новые причины отказа `INSUFFICIENT_CHARGE` / `ROUTE_EXCEEDS_CAPACITY`,
++срочность `normal | urgent | critical`, статусы доставки. API и UI
++сохраняют временную обратную совместимость через DTO-слой.
++Подробности — в `docs/game-rules.md` и `docs/architecture.md`.
+diff --git a/TASKS.md b/TASKS.md
+index 7442cde..f866a48 100644
+--- a/TASKS.md
++++ b/TASKS.md
+@@ -58,3 +58,21 @@
+ - [ ] `pnpm audit` — результаты задокументированы.
+ - [ ] В репозитории нет `.env` и `*.db`.
+ - [ ] Демонстрационный сценарий из README пройдён вручную.
++
++
++---
++
++## Game Design v2 — Итерация 1 (выполнено в этом патче)
++
++- [x] Разделить `credits` на `balanceCredits` и `earnedCredits`; победа по
++      `earnedCredits`.
++- [x] Разделить `battery` на `batteryCharge` и `batteryCapacity`.
++- [x] Добавить уровни улучшений ровера и `computeRoverStats` (RoverStats).
++- [x] Перевести расчёты доставки на `RoverStats`.
++- [x] Добавить причины `INSUFFICIENT_CHARGE` и `ROUTE_EXCEEDS_CAPACITY`.
++- [x] Сменить срочность на `normal | urgent | critical` (DTO — легаси).
++- [x] Добавить доставке `status`, `startedAt`, `completesAt`, nullable `result`.
++- [x] Сохранить обратную совместимость API/UI через DTO.
++- [ ] Сгенерировать миграцию Prisma локально (`pnpm db:migrate`).
++- [ ] Реализовать UI улучшений роверов и переход `in_transit -> completed`
++      (следующие итерации).
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 2366406..439f75d 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -117,3 +117,36 @@ DTO (DeliveryResultDto)
+ - **Заменяемость хранилища.** Переход на PostgreSQL затрагивает `infrastructure/` и `schema.prisma`, но не domain и application.
+ - **Читаемость для ревью.** По имени файла видно, где искать формулу, правило, запрос или разметку.
+ - **Соразмерность.** Никаких лишних абстракций: репозитории — простые функции, состояние клиента — обычный React state, транзакция — `prisma.$transaction`.
++
++
++---
++
++## Game Design v2 — Итерация 1 (заметки по архитектуре)
++
++### Новый порт: Clock
++- В `ServiceDeps` добавлен порт `clock: Clock` (`now(): Date`).
++- Прод-реализация — `createSystemClock` в `src/infrastructure/clock.ts`.
++- Тесты используют `createFixedClock` из
++  `tests/support/inMemoryRepositories.ts`, поэтому `startedAt`/`completesAt`
++  детерминированы.
++- Доменный слой остаётся чистым: время приходит только из приложения.
++
++### Слой DTO как граница совместимости
++- Доменная модель переименована (`balanceCredits`/`earnedCredits`,
++  `batteryCharge`/`batteryCapacity`, новая срочность), но контракты API/UI
++  пока не меняются.
++- `src/application/dto.ts` отображает старые имена на новые:
++  - `SessionDto.credits = balanceCredits` (+ новые `balanceCredits`,
++    `earnedCredits`);
++  - `RoverDto.battery = batteryCharge` (+ `batteryCharge`, `batteryCapacity`,
++    уровни улучшений и `stats: RoverStats`);
++  - `OrderDto.urgency` — легаси-значения через `URGENCY_TO_DTO`.
++- Презентационные компоненты (`StatusBar`, `RoverList`, `OrderList`) не
++  меняются и продолжают читать `credits`, `battery`, `urgency`.
++
++### Инфраструктура
++- `mappers.ts` и `repositories.ts` работают с новыми колонками; строки
++  по-прежнему валидируются Zod-схемами перед превращением в доменные
++  объекты.
++- Изменение `prisma/schema.prisma` требует ручной генерации миграции
++  (`pnpm db:migrate`) — миграция намеренно не входит в патч.
+diff --git a/docs/game-rules.md b/docs/game-rules.md
+index fef73cb..adaad0b 100644
+--- a/docs/game-rules.md
++++ b/docs/game-rules.md
+@@ -112,3 +112,51 @@ evaluateSessionStatus:
+ ## Хранение enum-значений
+ 
+ SQLite (через Prisma) не поддерживает нативные enum, поэтому `status`, `zoneType`, `urgency`, `result` и `type` хранятся как TEXT. Допустимые значения задаются массивами в `src/domain/types.ts`, проверяются guard-функциями и Zod-схемами при чтении строк из базы (`src/infrastructure/mappers.ts`). Некорректное значение в базе приводит к контролируемой ошибке, а не к «тихому» неверному поведению.
++
++
++---
++
++## Game Design v2 — Итерация 1 (обратная совместимость DTO)
++
++Эта итерация меняет доменную модель. API и UI временно сохраняют старые
++имена полей через DTO-слой (см. `docs/architecture.md`).
++
++### Кредиты
++- `credits` разделены на два поля сессии:
++  - `balanceCredits` — текущий баланс (старт 500), тратится на улучшения;
++  - `earnedCredits` — суммарно заработано за игру (старт 0), только растёт
++    при успешной доставке.
++- Победа теперь определяется по `earnedCredits >= targetCredits` (4000).
++
++### Батарея
++- `battery` разделена на:
++  - `batteryCharge` — текущий заряд;
++  - `batteryCapacity` — базовая максимальная ёмкость.
++- Ограничения расхода считаются по эффективной ёмкости из `RoverStats`.
++
++### Улучшения ровера и RoverStats
++- У ровера появились целочисленные уровни `capacityLevel`, `speedLevel`,
++  `efficiencyLevel`, `batteryLevel` (по умолчанию 0).
++- Эффективные характеристики считает `computeRoverStats`:
++  `эффективное = базовое * (1 + max(0, уровень) * ROVER_UPGRADE_STEP)`,
++  где `ROVER_UPGRADE_STEP = 0.25`. При уровне 0 эффективное равно базовому.
++- Все расчёты доставки (расход, длительность, риск, вместимость) используют
++  `RoverStats`, а не «сырые» поля ровера.
++
++### Причины отказа
++- `INSUFFICIENT_BATTERY` заменена на `INSUFFICIENT_CHARGE`
++  (`стоимость > batteryCharge`).
++- Добавлена `ROUTE_EXCEEDS_CAPACITY` (`стоимость > batteryCapacity`).
++- `CAPACITY_EXCEEDED` по-прежнему про вес груза (`вес > capacity`).
++- Причины взаимоисключающие в порядке: вес → ёмкость батареи → текущий заряд.
++
++### Срочность заказов
++- Внутренняя шкала теперь `normal | urgent | critical`.
++- DTO отдаёт легаси-значения `low | medium | critical` для совместимости UI.
++
++### Жизненный цикл доставки
++- У доставки появились `status` (`in_transit | completed | failed`),
++  `startedAt`, `completesAt` и `result` (nullable).
++- В этой итерации доставка сразу переходит в терминальный статус
++  (`completed`/`failed`), `result` заполняется, `startedAt = clock.now()`,
++  `completesAt = startedAt + длительность_в_часах`.
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index e00f889..cce733f 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -18,7 +18,10 @@ model GameSession {
+   id            String   @id
+   currentDay    Int
+   maxDays       Int
+-  credits       Int
++  /// Spendable balance. Rewards are added here; upgrades will be paid from here.
++  balanceCredits Int
++  /// Lifetime credits earned. Never decreases; the win condition checks this.
++  earnedCredits Int
+   targetCredits Int
+   rating        Int
+   minimumRating Int
+@@ -52,20 +55,30 @@ model Location {
+ }
+ 
+ model Rover {
+-  id         String   @id
+-  name       String   @unique
+-  /// Battery charge in percent points (0-100).
+-  battery    Int
+-  /// Cargo capacity in kilograms.
+-  capacity   Int
+-  /// Travel speed in km/hour.
+-  speed      Float
+-  /// Battery efficiency multiplier (higher is better).
+-  efficiency Float
++  id              String   @id
++  name            String   @unique
++  /// Current battery charge in percent points.
++  batteryCharge   Int
++  /// Base maximum battery charge in percent points (before the battery upgrade).
++  batteryCapacity Int
++  /// Base cargo capacity in kilograms.
++  capacity        Int
++  /// Base travel speed in km/hour.
++  speed           Float
++  /// Base battery efficiency multiplier (higher is better).
++  efficiency      Float
++  /// Cargo-capacity upgrade level (0 = no upgrade).
++  capacityLevel   Int      @default(0)
++  /// Speed upgrade level (0 = no upgrade).
++  speedLevel      Int      @default(0)
++  /// Efficiency upgrade level (0 = no upgrade).
++  efficiencyLevel Int      @default(0)
++  /// Battery-capacity upgrade level (0 = no upgrade).
++  batteryLevel    Int      @default(0)
+   /// RoverStatus: "idle" | "delivering" | "charging" | "damaged"
+-  status     String
+-  createdAt  DateTime @default(now())
+-  updatedAt  DateTime @updatedAt
++  status          String
++  createdAt       DateTime @default(now())
++  updatedAt       DateTime @updatedAt
+ 
+   deliveries Delivery[]
+ }
+@@ -79,7 +92,7 @@ model Order {
+   weight      Int
+   /// Reward in credits.
+   reward      Int
+-  /// OrderUrgency: "low" | "medium" | "critical"
++  /// OrderUrgency: "normal" | "urgent" | "critical"
+   urgency     String
+   /// Base risk in percentage points.
+   baseRisk    Int
+@@ -110,8 +123,14 @@ model Delivery {
+   calculatedDuration    Int
+   /// Reward in credits copied from the order at start time.
+   reward                Int
+-  /// DeliveryResult: "success" | "failed"
+-  result                String
++  /// DeliveryStatus: "in_transit" | "completed" | "failed"
++  status                String
++  /// When the delivery started (server clock).
++  startedAt             DateTime
++  /// When the delivery is expected to complete (startedAt + duration hours).
++  completesAt           DateTime
++  /// DeliveryResult: "success" | "failed". Null while a delivery is in transit.
++  result                String?
+   /// Client-supplied key protecting against double submits.
+   idempotencyKey        String   @unique
+   createdAt             DateTime @default(now())
+diff --git a/prisma/seed.ts b/prisma/seed.ts
+index 7ba7246..663bcb4 100644
+--- a/prisma/seed.ts
++++ b/prisma/seed.ts
+@@ -45,7 +45,8 @@ async function main(): Promise<void> {
+     update: {
+       currentDay: DEFAULT_SESSION.currentDay,
+       maxDays: DEFAULT_SESSION.maxDays,
+-      credits: DEFAULT_SESSION.credits,
++      balanceCredits: DEFAULT_SESSION.balanceCredits,
++      earnedCredits: DEFAULT_SESSION.earnedCredits,
+       targetCredits: DEFAULT_SESSION.targetCredits,
+       rating: DEFAULT_SESSION.rating,
+       minimumRating: DEFAULT_SESSION.minimumRating,
+@@ -55,7 +56,8 @@ async function main(): Promise<void> {
+       id: LOCAL_SESSION_ID,
+       currentDay: DEFAULT_SESSION.currentDay,
+       maxDays: DEFAULT_SESSION.maxDays,
+-      credits: DEFAULT_SESSION.credits,
++      balanceCredits: DEFAULT_SESSION.balanceCredits,
++      earnedCredits: DEFAULT_SESSION.earnedCredits,
+       targetCredits: DEFAULT_SESSION.targetCredits,
+       rating: DEFAULT_SESSION.rating,
+       minimumRating: DEFAULT_SESSION.minimumRating,
+diff --git a/prisma/seedData.ts b/prisma/seedData.ts
+index e59d339..e075138 100644
+--- a/prisma/seedData.ts
++++ b/prisma/seedData.ts
+@@ -9,6 +9,10 @@
+  * - `order-drill-rig` (45 kg) fits only Cargo-02;
+  * - `order-geo-samples` (Aitken basin) needs more battery than any rover has;
+  * - `order-oxygen-tanks` and `order-antenna-repair` are critical orders.
++ *
++ * Game Design v2: rovers now start at level 0 on every upgrade, with the
++ * battery split into batteryCharge (current) and batteryCapacity (maximum).
++ * Urgency values use the new internal scale (normal | urgent | critical).
+  */
+ 
+ import type {
+@@ -94,28 +98,43 @@ export const SEED_ROVERS: readonly Rover[] = [
+   {
+     id: 'rover-scout-01',
+     name: 'Scout-01',
+-    battery: 100,
++    batteryCharge: 100,
++    batteryCapacity: 100,
+     capacity: 20,
+     speed: 6,
+     efficiency: 1.4,
++    capacityLevel: 0,
++    speedLevel: 0,
++    efficiencyLevel: 0,
++    batteryLevel: 0,
+     status: IDLE,
+   },
+   {
+     id: 'rover-cargo-02',
+     name: 'Cargo-02',
+-    battery: 100,
++    batteryCharge: 100,
++    batteryCapacity: 100,
+     capacity: 60,
+     speed: 3,
+     efficiency: 0.9,
++    capacityLevel: 0,
++    speedLevel: 0,
++    efficiencyLevel: 0,
++    batteryLevel: 0,
+     status: IDLE,
+   },
+   {
+     id: 'rover-sprint-03',
+     name: 'Sprint-03',
+-    battery: 100,
++    batteryCharge: 100,
++    batteryCapacity: 100,
+     capacity: 35,
+     speed: 9,
+     efficiency: 1.1,
++    capacityLevel: 0,
++    speedLevel: 0,
++    efficiencyLevel: 0,
++    batteryLevel: 0,
+     status: IDLE,
+   },
+ ]
+@@ -130,7 +149,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-serenity',
+     weight: 8,
+     reward: 320,
+-    urgency: 'medium',
++    urgency: 'urgent',
+     baseRisk: 5,
+     deadlineDay: 2,
+     status: AVAILABLE,
+@@ -142,7 +161,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-tranquility',
+     weight: 5,
+     reward: 240,
+-    urgency: 'low',
++    urgency: 'normal',
+     baseRisk: 4,
+     deadlineDay: 6,
+     status: AVAILABLE,
+@@ -154,7 +173,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-serenity',
+     weight: 25,
+     reward: 430,
+-    urgency: 'low',
++    urgency: 'normal',
+     baseRisk: 6,
+     deadlineDay: 5,
+     status: AVAILABLE,
+@@ -166,7 +185,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-tranquility',
+     weight: 30,
+     reward: 520,
+-    urgency: 'medium',
++    urgency: 'urgent',
+     baseRisk: 8,
+     deadlineDay: 3,
+     status: AVAILABLE,
+@@ -190,7 +209,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-copernicus',
+     weight: 45,
+     reward: 900,
+-    urgency: 'low',
++    urgency: 'normal',
+     baseRisk: 10,
+     deadlineDay: 4,
+     status: AVAILABLE,
+@@ -214,7 +233,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-tycho',
+     weight: 80,
+     reward: 1500,
+-    urgency: 'low',
++    urgency: 'normal',
+     baseRisk: 15,
+     deadlineDay: 6,
+     status: AVAILABLE,
+@@ -227,7 +246,7 @@ export const SEED_ORDERS: readonly Order[] = [
+     locationId: 'loc-aitken',
+     weight: 12,
+     reward: 850,
+-    urgency: 'low',
++    urgency: 'normal',
+     baseRisk: 12,
+     deadlineDay: 7,
+     status: AVAILABLE,
+diff --git a/src/application/dto.ts b/src/application/dto.ts
+index 9c25116..db527f4 100644
+--- a/src/application/dto.ts
++++ b/src/application/dto.ts
+@@ -3,9 +3,16 @@
+  *
+  * DTOs are explicit and free of internal fields (no timestamps of internal
+  * rows, no idempotency keys, no database metadata beyond what the UI needs).
++ *
++ * Game Design v2 keeps the wire shape backward compatible on purpose: the
++ * legacy fields `credits`, `battery` and the legacy `urgency` values are still
++ * emitted so the current UI and e2e keep working, while the new fields are
++ * added alongside them.
+  */
+ 
++import { computeRoverStats } from '@/domain'
+ import { BLOCK_REASON_MESSAGES } from '@/shared/messages'
++import type { DtoOrderUrgency } from '@/shared/messages'
+ import type {
+   DeliveryBlockReason,
+   DeliveryEstimate,
+@@ -17,12 +24,20 @@ import type {
+   OrderStatus,
+   OrderUrgency,
+   Rover,
++  RoverStats,
+   RoverStatus,
+   SessionStatus,
+   ZoneType,
+ } from '@/domain/types'
+ import type { GameEventRecord } from './ports'
+ 
++/** Maps the new internal urgency values back to the legacy wire values. */
++const URGENCY_TO_DTO: Record<OrderUrgency, DtoOrderUrgency> = {
++  normal: 'low',
++  urgent: 'medium',
++  critical: 'critical',
++}
++
+ export type BlockReasonDto = {
+   readonly code: DeliveryBlockReason
+   readonly message: string
+@@ -32,7 +47,10 @@ export type SessionDto = {
+   readonly id: string
+   readonly currentDay: number
+   readonly maxDays: number
++  /** Spendable balance, kept as `credits` for backward compatibility. */
+   readonly credits: number
++  readonly balanceCredits: number
++  readonly earnedCredits: number
+   readonly targetCredits: number
+   readonly rating: number
+   readonly minimumRating: number
+@@ -54,11 +72,21 @@ export type LocationDto = {
+ export type RoverDto = {
+   readonly id: string
+   readonly name: string
++  /** Current charge, kept as `battery` for backward compatibility. */
+   readonly battery: number
++  /** Base cargo capacity, kept for backward compatibility. */
+   readonly capacity: number
+   readonly speed: number
+   readonly efficiency: number
+   readonly status: RoverStatus
++  readonly batteryCharge: number
++  readonly batteryCapacity: number
++  readonly capacityLevel: number
++  readonly speedLevel: number
++  readonly efficiencyLevel: number
++  readonly batteryLevel: number
++  /** Effective characteristics after upgrades. */
++  readonly stats: RoverStats
+ }
+ 
+ export type OrderDto = {
+@@ -68,7 +96,8 @@ export type OrderDto = {
+   readonly locationId: string
+   readonly weight: number
+   readonly reward: number
+-  readonly urgency: OrderUrgency
++  /** Legacy urgency value kept for backward compatibility. */
++  readonly urgency: DtoOrderUrgency
+   readonly baseRisk: number
+   readonly deadlineDay: number
+   readonly status: OrderStatus
+@@ -129,7 +158,9 @@ export function toSessionDto(session: GameSession): SessionDto {
+     id: session.id,
+     currentDay: session.currentDay,
+     maxDays: session.maxDays,
+-    credits: session.credits,
++    credits: session.balanceCredits,
++    balanceCredits: session.balanceCredits,
++    earnedCredits: session.earnedCredits,
+     targetCredits: session.targetCredits,
+     rating: session.rating,
+     minimumRating: session.minimumRating,
+@@ -152,14 +183,22 @@ export function toLocationDto(location: MoonLocation): LocationDto {
+ }
+ 
+ export function toRoverDto(rover: Rover): RoverDto {
++  const stats = computeRoverStats(rover)
+   return {
+     id: rover.id,
+     name: rover.name,
+-    battery: rover.battery,
++    battery: rover.batteryCharge,
+     capacity: rover.capacity,
+     speed: rover.speed,
+     efficiency: rover.efficiency,
+     status: rover.status,
++    batteryCharge: rover.batteryCharge,
++    batteryCapacity: stats.batteryCapacity,
++    capacityLevel: rover.capacityLevel,
++    speedLevel: rover.speedLevel,
++    efficiencyLevel: rover.efficiencyLevel,
++    batteryLevel: rover.batteryLevel,
++    stats,
+   }
+ }
+ 
+@@ -171,7 +210,7 @@ export function toOrderDto(order: Order): OrderDto {
+     locationId: order.locationId,
+     weight: order.weight,
+     reward: order.reward,
+-    urgency: order.urgency,
++    urgency: URGENCY_TO_DTO[order.urgency],
+     baseRisk: order.baseRisk,
+     deadlineDay: order.deadlineDay,
+     status: order.status,
+diff --git a/src/application/errors.ts b/src/application/errors.ts
+index 229b09e..228d799 100644
+--- a/src/application/errors.ts
++++ b/src/application/errors.ts
+@@ -20,7 +20,8 @@ export const APP_ERROR_CODES = [
+   'ORDER_NOT_AVAILABLE',
+   'ROVER_NOT_IDLE',
+   'CAPACITY_EXCEEDED',
+-  'INSUFFICIENT_BATTERY',
++  'ROUTE_EXCEEDS_CAPACITY',
++  'INSUFFICIENT_CHARGE',
+   'DEADLINE_PASSED',
+   'DUPLICATE_REQUEST',
+   'ACTION_NOT_ALLOWED',
+@@ -47,7 +48,8 @@ const HTTP_STATUS_BY_CODE: Record<AppErrorCode, number> = {
+   ORDER_NOT_AVAILABLE: 409,
+   ROVER_NOT_IDLE: 409,
+   CAPACITY_EXCEEDED: 422,
+-  INSUFFICIENT_BATTERY: 422,
++  ROUTE_EXCEEDS_CAPACITY: 422,
++  INSUFFICIENT_CHARGE: 422,
+   DEADLINE_PASSED: 409,
+   DUPLICATE_REQUEST: 409,
+   ACTION_NOT_ALLOWED: 403,
+@@ -64,7 +66,8 @@ const MESSAGE_BY_CODE: Record<AppErrorCode, string> = {
+   ORDER_NOT_AVAILABLE: BLOCK_REASON_MESSAGES.ORDER_NOT_AVAILABLE,
+   ROVER_NOT_IDLE: BLOCK_REASON_MESSAGES.ROVER_NOT_IDLE,
+   CAPACITY_EXCEEDED: BLOCK_REASON_MESSAGES.CAPACITY_EXCEEDED,
+-  INSUFFICIENT_BATTERY: BLOCK_REASON_MESSAGES.INSUFFICIENT_BATTERY,
++  ROUTE_EXCEEDS_CAPACITY: BLOCK_REASON_MESSAGES.ROUTE_EXCEEDS_CAPACITY,
++  INSUFFICIENT_CHARGE: BLOCK_REASON_MESSAGES.INSUFFICIENT_CHARGE,
+   DEADLINE_PASSED: BLOCK_REASON_MESSAGES.DEADLINE_PASSED,
+   DUPLICATE_REQUEST: BLOCK_REASON_MESSAGES.DUPLICATE_REQUEST,
+   ACTION_NOT_ALLOWED: 'Действие запрещено в текущей конфигурации',
+@@ -107,9 +110,7 @@ export class AppError extends Error {
+    * reason defines the error code, the full list is exposed in `details` so the
+    * UI can explain every blocker.
+    */
+-  static fromBlockReasons(
+-    reasons: readonly DeliveryBlockReason[],
+-  ): AppError {
++  static fromBlockReasons(reasons: readonly DeliveryBlockReason[]): AppError {
+     const [primary] = reasons
+     const code: AppErrorCode = primary ?? 'ACTION_NOT_ALLOWED'
+ 
+diff --git a/src/application/gameDefaults.ts b/src/application/gameDefaults.ts
+index ff38921..d2b680e 100644
+--- a/src/application/gameDefaults.ts
++++ b/src/application/gameDefaults.ts
+@@ -14,14 +14,15 @@ export const DEFAULT_SESSION: SessionDefaults = {
+   id: LOCAL_SESSION_ID,
+   currentDay: 1,
+   maxDays: 7,
+-  credits: 500,
++  balanceCredits: 500,
++  earnedCredits: 0,
+   targetCredits: 4000,
+   rating: 100,
+   minimumRating: 60,
+ }
+ 
+-/** Battery charge every rover starts with. */
+-export const DEFAULT_ROVER_BATTERY = 100
++/** Battery charge every rover starts with when the game is reset. */
++export const DEFAULT_ROVER_BATTERY_CHARGE = 100
+ 
+ /** Base coordinates for the SVG placeholder map (viewBox units). */
+ export const BASE_POSITION = { x: 40, y: 40 } as const
+diff --git a/src/application/ports.ts b/src/application/ports.ts
+index fd94db8..112835a 100644
+--- a/src/application/ports.ts
++++ b/src/application/ports.ts
+@@ -7,6 +7,7 @@
+ 
+ import type {
+   DeliveryResult,
++  DeliveryStatus,
+   GameEventType,
+   GameSession,
+   MoonLocation,
+@@ -28,6 +29,11 @@ export type IdGenerator = {
+   next(): string
+ }
+ 
++/** Server-side clock, injectable for deterministic tests. */
++export type Clock = {
++  now(): Date
++}
++
+ export type DeliveryRecord = {
+   readonly id: string
+   readonly gameSessionId: string
+@@ -37,7 +43,11 @@ export type DeliveryRecord = {
+   readonly calculatedRisk: number
+   readonly calculatedDuration: number
+   readonly reward: number
+-  readonly result: DeliveryResult
++  readonly status: DeliveryStatus
++  readonly startedAt: Date
++  readonly completesAt: Date
++  /** Null while a delivery is in transit; always set in iteration 1. */
++  readonly result: DeliveryResult | null
+   readonly idempotencyKey: string
+   readonly createdAt: Date
+ }
+@@ -63,7 +73,14 @@ export type CreateDeliveryInput = {
+   readonly calculatedRisk: number
+   readonly calculatedDuration: number
+   readonly reward: number
+-  readonly result: DeliveryResult
++  readonly status: DeliveryStatus
++  readonly startedAt: Date
++  readonly completesAt: Date
++  /**
++   * Iteration 1 always resolves the delivery immediately, so this is set on
++   * creation. `null` is reserved for future `in_transit` deliveries.
++   */
++  readonly result: DeliveryResult | null
+   readonly idempotencyKey: string
+ }
+ 
+@@ -80,13 +97,14 @@ export type CreateEventInput = {
+ 
+ export type SessionPatch = {
+   readonly currentDay?: number
+-  readonly credits?: number
++  readonly balanceCredits?: number
++  readonly earnedCredits?: number
+   readonly rating?: number
+   readonly status?: SessionStatus
+ }
+ 
+ export type RoverPatch = {
+-  readonly battery?: number
++  readonly batteryCharge?: number
+   readonly status?: RoverStatus
+ }
+ 
+@@ -94,7 +112,8 @@ export type SessionDefaults = {
+   readonly id: string
+   readonly currentDay: number
+   readonly maxDays: number
+-  readonly credits: number
++  readonly balanceCredits: number
++  readonly earnedCredits: number
+   readonly targetCredits: number
+   readonly rating: number
+   readonly minimumRating: number
+@@ -131,7 +150,7 @@ export type GameRepositories = {
+    */
+   restartGame(input: {
+     readonly session: SessionDefaults
+-    readonly roverBattery: number
++    readonly roverBatteryCharge: number
+   }): Promise<GameSession>
+ }
+ 
+@@ -148,4 +167,5 @@ export type ServiceDeps = {
+   readonly uow: UnitOfWork
+   readonly random: RandomSource
+   readonly ids: IdGenerator
++  readonly clock: Clock
+ }
+diff --git a/src/application/services/endDay.ts b/src/application/services/endDay.ts
+index 7225a07..7482529 100644
+--- a/src/application/services/endDay.ts
++++ b/src/application/services/endDay.ts
+@@ -32,7 +32,7 @@ export async function endDay(deps: ServiceDeps): Promise<EndDayDto> {
+ 
+     for (const update of outcome.batteryUpdates) {
+       await repositories.updateRover(update.roverId, {
+-        battery: update.batteryAfter,
++        batteryCharge: update.batteryAfter,
+       })
+     }
+ 
+diff --git a/src/application/services/resetGame.ts b/src/application/services/resetGame.ts
+index 4f77d03..3e9f20a 100644
+--- a/src/application/services/resetGame.ts
++++ b/src/application/services/resetGame.ts
+@@ -9,7 +9,7 @@
+ 
+ import { toSessionDto, type SessionDto } from '../dto'
+ import { AppError } from '../errors'
+-import { DEFAULT_ROVER_BATTERY, DEFAULT_SESSION } from '../gameDefaults'
++import { DEFAULT_ROVER_BATTERY_CHARGE, DEFAULT_SESSION } from '../gameDefaults'
+ import type { ServiceDeps } from '../ports'
+ 
+ export type ResetGameOptions = {
+@@ -23,15 +23,14 @@ export async function resetGame(
+ ): Promise<SessionDto> {
+   if (!options.allowed) {
+     throw new AppError('ACTION_NOT_ALLOWED', {
+-      message:
+-        'Сброс игры доступен только в локальной тестовой среде',
++      message: 'Сброс игры доступен только в локальной тестовой среде',
+     })
+   }
+ 
+   return deps.uow.transaction(async (repositories) => {
+     const session = await repositories.restartGame({
+       session: DEFAULT_SESSION,
+-      roverBattery: DEFAULT_ROVER_BATTERY,
++      roverBatteryCharge: DEFAULT_ROVER_BATTERY_CHARGE,
+     })
+ 
+     await repositories.createEvent({
+diff --git a/src/application/services/startDelivery.ts b/src/application/services/startDelivery.ts
+index 00d75c8..32505ff 100644
+--- a/src/application/services/startDelivery.ts
++++ b/src/application/services/startDelivery.ts
+@@ -4,10 +4,10 @@
+  * Everything happens inside one transaction:
+  * 1. reload session, order, rover and location;
+  * 2. check the idempotency key (a replay returns the stored result);
+- * 3. recalculate the estimate on the server;
++ * 3. recalculate the estimate on the server (from effective RoverStats);
+  * 4. check the eligibility rules;
+  * 5. resolve the outcome with an injected random roll;
+- * 6. persist delivery, rover battery, order status, credits, rating, event;
++ * 6. persist delivery, rover charge, order status, credits, rating, event;
+  * 7. re-evaluate win/lose;
+  * 8. return a safe DTO.
+  *
+@@ -20,12 +20,18 @@ import {
+   evaluateDeliveryEligibility,
+   resolveDeliveryResult,
+ } from '@/domain'
+-import type { DeliveryContext, GameEventType } from '@/domain/types'
++import type {
++  DeliveryContext,
++  DeliveryStatus,
++  GameEventType,
++} from '@/domain/types'
+ import { toSessionDto, type DeliveryResultDto } from '../dto'
+ import { AppError } from '../errors'
+ import type { GameRepositories, ServiceDeps } from '../ports'
+ import type { StartDeliveryInput } from '../schemas'
+ 
++const MILLISECONDS_PER_HOUR = 60 * 60 * 1000
++
+ async function buildReplayDto(
+   repositories: GameRepositories,
+   idempotencyKey: string,
+@@ -40,7 +46,8 @@ async function buildReplayDto(
+     deliveryId: existing.id,
+     orderId: existing.orderId,
+     roverId: existing.roverId,
+-    result: existing.result,
++    // Iteration 1 deliveries are always resolved, so `result` is never null here.
++    result: existing.result ?? 'failed',
+     batteryCost: existing.calculatedBatteryCost,
+     duration: existing.calculatedDuration,
+     risk: existing.calculatedRisk,
+@@ -54,6 +61,8 @@ async function buildReplayDto(
+             currentDay: 0,
+             maxDays: 0,
+             credits: 0,
++            balanceCredits: 0,
++            earnedCredits: 0,
+             targetCredits: 0,
+             rating: 0,
+             minimumRating: 0,
+@@ -116,6 +125,15 @@ export async function startDelivery(
+     const result = resolveDeliveryResult(estimate.risk, roll)
+     const effects = applyDeliveryEffects(context, estimate, result)
+ 
++    const startedAt = deps.clock.now()
++    const completesAt = new Date(
++      startedAt.getTime() + estimate.duration * MILLISECONDS_PER_HOUR,
++    )
++    // Iteration 1 resolves the delivery immediately, so the persisted status is
++    // already terminal ("completed" / "failed"), never "in_transit".
++    const deliveryStatus: DeliveryStatus =
++      result === 'success' ? 'completed' : 'failed'
++
+     const delivery = await repositories.createDelivery({
+       id: deps.ids.next(),
+       gameSessionId: session.id,
+@@ -125,19 +143,23 @@ export async function startDelivery(
+       calculatedRisk: estimate.risk,
+       calculatedDuration: estimate.duration,
+       reward: estimate.reward,
++      status: deliveryStatus,
++      startedAt,
++      completesAt,
+       result,
+       idempotencyKey: input.idempotencyKey,
+     })
+ 
+     await repositories.updateRover(rover.id, {
+-      battery: effects.batteryAfter,
++      batteryCharge: effects.batteryAfter,
+       status: effects.roverStatus,
+     })
+ 
+     await repositories.updateOrderStatus(order.id, effects.orderStatus)
+ 
+     const updatedSession = await repositories.updateSession(session.id, {
+-      credits: effects.creditsAfter,
++      balanceCredits: effects.balanceCreditsAfter,
++      earnedCredits: effects.earnedCreditsAfter,
+       rating: effects.ratingAfter,
+       status: effects.sessionStatus,
+     })
+@@ -177,7 +199,7 @@ export async function startDelivery(
+           effects.sessionStatus === 'won' ? 'Цель достигнута' : 'Игра проиграна',
+         description:
+           effects.sessionStatus === 'won'
+-            ? `Набрано ${effects.creditsAfter} из ${session.targetCredits} кредитов.`
++            ? `Заработано ${effects.earnedCreditsAfter} из ${session.targetCredits} кредитов.`
+             : `Рейтинг опустился до ${effects.ratingAfter} при минимуме ${session.minimumRating}.`,
+         day: session.currentDay,
+       })
+diff --git a/src/domain/calculations.ts b/src/domain/calculations.ts
+index e459a69..22f1070 100644
+--- a/src/domain/calculations.ts
++++ b/src/domain/calculations.ts
+@@ -6,6 +6,9 @@
+  * - duration:    ceil() to whole hours
+  * - risk:        round() to whole percent points, then clamped to [0, 90]
+  *
++ * Game Design v2: every calculation runs on the EFFECTIVE rover stats
++ * (`computeRoverStats`), never on the raw base values.
++ *
+  * These functions never touch React, Prisma, Next.js, randomness or time.
+  */
+ 
+@@ -17,28 +20,29 @@ import {
+ } from './constants'
+ import { assertFinite, assertPositive } from './errors'
+ import { ceilToInt, clamp, roundToInt } from './math'
++import { computeRoverStats } from './roverStats'
+ import type {
+   DeliveryContext,
+   DeliveryEstimate,
+   MoonLocation,
+   Order,
+-  Rover,
++  RoverStats,
+ } from './types'
+ 
+ type BatteryInput = {
+   order: Pick<Order, 'weight'>
+-  rover: Pick<Rover, 'efficiency'>
++  rover: Pick<RoverStats, 'efficiency'>
+   location: Pick<MoonLocation, 'distance' | 'batteryModifier'>
+ }
+ 
+ type DurationInput = {
+-  rover: Pick<Rover, 'speed'>
++  rover: Pick<RoverStats, 'speed'>
+   location: Pick<MoonLocation, 'distance' | 'speedModifier'>
+ }
+ 
+ type RiskInput = {
+   order: Pick<Order, 'weight' | 'baseRisk'>
+-  rover: Pick<Rover, 'capacity'>
++  rover: Pick<RoverStats, 'capacity'>
+   location: Pick<MoonLocation, 'riskBonus'>
+ }
+ 
+@@ -86,12 +90,13 @@ export function calculateRisk({ order, rover, location }: RiskInput): number {
+ export function calculateDeliveryEstimate(
+   context: DeliveryContext,
+ ): DeliveryEstimate {
+-  const { order, rover, location } = context
++  const { order, location } = context
++  const stats = computeRoverStats(context.rover)
+ 
+   return {
+-    batteryCost: calculateBatteryCost({ order, rover, location }),
+-    duration: calculateDuration({ rover, location }),
+-    risk: calculateRisk({ order, rover, location }),
++    batteryCost: calculateBatteryCost({ order, rover: stats, location }),
++    duration: calculateDuration({ rover: stats, location }),
++    risk: calculateRisk({ order, rover: stats, location }),
+     reward: order.reward,
+   }
+ }
+diff --git a/src/domain/constants.ts b/src/domain/constants.ts
+index f03f2a1..d708a0e 100644
+--- a/src/domain/constants.ts
++++ b/src/domain/constants.ts
+@@ -5,7 +5,7 @@
+  * - distance: kilometres (km)
+  * - weight / capacity: kilograms (kg)
+  * - speed: km per hour (km/h)
+- * - battery: integer percent points (0-100)
++ * - battery: integer percent points (0-capacity)
+  * - duration: whole hours, rounded up
+  * - risk: integer percent points (0-90)
+  * - credits / reward: whole credits
+@@ -15,7 +15,7 @@
+ /** Lowest possible battery charge. Battery must never go below this value. */
+ export const MIN_BATTERY = 0
+ 
+-/** Highest possible battery charge. */
++/** Default battery capacity a rover has before any battery upgrade. */
+ export const MAX_BATTERY = 100
+ 
+ /** Battery points spent per kilogram of cargo, before rover efficiency. */
+@@ -56,3 +56,6 @@ export const BATTERY_RECHARGE_PER_DAY = 40
+ 
+ /** Number of most recent events exposed through the game state DTO. */
+ export const RECENT_EVENTS_LIMIT = 12
++
++/** Fraction of a rover attribute's base value added per upgrade level. */
++export const ROVER_UPGRADE_STEP = 0.25
+diff --git a/src/domain/endDay.ts b/src/domain/endDay.ts
+index 6f07395..224f51d 100644
+--- a/src/domain/endDay.ts
++++ b/src/domain/endDay.ts
+@@ -5,13 +5,13 @@
+  * 1. the day counter moves to `currentDay + 1`;
+  * 2. every still available order whose deadline is now in the past expires;
+  * 3. expired orders reduce the rating (critical orders cost more);
+- * 4. every parked rover (idle or charging) recharges by a fixed amount;
++ * 4. every parked rover (idle or charging) recharges by a fixed amount, capped
++ *    at its effective battery capacity;
+  * 5. the session status is re-evaluated.
+  */
+ 
+ import {
+   BATTERY_RECHARGE_PER_DAY,
+-  MAX_BATTERY,
+   MAX_RATING,
+   MIN_BATTERY,
+   MIN_RATING,
+@@ -20,6 +20,7 @@ import {
+ } from './constants'
+ import { clamp } from './math'
+ import { evaluateSessionStatus } from './outcome'
++import { computeRoverStats } from './roverStats'
+ import type { EndOfDayResult, GameSession, Order, Rover } from './types'
+ 
+ export type EndOfDayInput = {
+@@ -47,29 +48,28 @@ export function resolveEndOfDay({
+     return total + penalty
+   }, 0)
+ 
+-  const ratingAfter = clamp(
+-    session.rating - ratingPenalty,
+-    MIN_RATING,
+-    MAX_RATING,
+-  )
++  const ratingAfter = clamp(session.rating - ratingPenalty, MIN_RATING, MAX_RATING)
+ 
+   const batteryUpdates = rovers
+     .filter((rover) => rover.status === 'idle' || rover.status === 'charging')
+-    .map((rover) => ({
+-      roverId: rover.id,
+-      batteryAfter: clamp(
+-        rover.battery + BATTERY_RECHARGE_PER_DAY,
+-        MIN_BATTERY,
+-        MAX_BATTERY,
+-      ),
+-    }))
++    .map((rover) => {
++      const stats = computeRoverStats(rover)
++      return {
++        roverId: rover.id,
++        batteryAfter: clamp(
++          rover.batteryCharge + BATTERY_RECHARGE_PER_DAY,
++          MIN_BATTERY,
++          stats.batteryCapacity,
++        ),
++      }
++    })
+     .filter((update) => {
+       const rover = rovers.find((item) => item.id === update.roverId)
+-      return rover !== undefined && rover.battery !== update.batteryAfter
++      return rover !== undefined && rover.batteryCharge !== update.batteryAfter
+     })
+ 
+   const sessionStatus = evaluateSessionStatus({
+-    credits: session.credits,
++    earnedCredits: session.earnedCredits,
+     targetCredits: session.targetCredits,
+     rating: ratingAfter,
+     minimumRating: session.minimumRating,
+diff --git a/src/domain/index.ts b/src/domain/index.ts
+index c5e937a..a767b41 100644
+--- a/src/domain/index.ts
++++ b/src/domain/index.ts
+@@ -4,6 +4,7 @@ export * from './constants'
+ export * from './types'
+ export * from './math'
+ export * from './errors'
++export * from './roverStats'
+ export * from './calculations'
+ export * from './rules'
+ export * from './outcome'
+diff --git a/src/domain/outcome.ts b/src/domain/outcome.ts
+index cae912a..33b4255 100644
+--- a/src/domain/outcome.ts
++++ b/src/domain/outcome.ts
+@@ -7,7 +7,6 @@
+  */
+ 
+ import {
+-  MAX_BATTERY,
+   MAX_RATING,
+   MAX_RISK_PERCENT,
+   MIN_BATTERY,
+@@ -19,6 +18,7 @@ import {
+ } from './constants'
+ import { DomainInvariantError } from './errors'
+ import { clamp } from './math'
++import { computeRoverStats } from './roverStats'
+ import type {
+   DeliveryContext,
+   DeliveryEffects,
+@@ -49,7 +49,7 @@ export function resolveDeliveryResult(
+ }
+ 
+ export type SessionOutcomeInput = {
+-  readonly credits: number
++  readonly earnedCredits: number
+   readonly targetCredits: number
+   readonly rating: number
+   readonly minimumRating: number
+@@ -61,12 +61,15 @@ export type SessionOutcomeInput = {
+  * Win / lose evaluation.
+  *
+  * Precedence: rating collapse -> target reached -> out of days.
++ *
++ * Game Design v2: the win condition checks lifetime `earnedCredits`, not the
++ * spendable balance.
+  */
+ export function evaluateSessionStatus(
+   input: SessionOutcomeInput,
+ ): SessionStatus {
+   if (input.rating < input.minimumRating) return 'lost'
+-  if (input.credits >= input.targetCredits) return 'won'
++  if (input.earnedCredits >= input.targetCredits) return 'won'
+   if (input.currentDay > input.maxDays) return 'lost'
+   return 'active'
+ }
+@@ -76,7 +79,8 @@ export function evaluateSessionStatus(
+  *
+  * A delivery is resolved immediately inside the same game day: the duration is
+  * informational, the rover returns to `idle` and only its battery is charged.
+- * The reward is added exactly once and only on success.
++ * The reward is added exactly once and only on success, to both the spendable
++ * balance and the lifetime earned total.
+  */
+ export function applyDeliveryEffects(
+   context: DeliveryContext,
+@@ -84,24 +88,27 @@ export function applyDeliveryEffects(
+   result: DeliveryResult,
+ ): DeliveryEffects {
+   const { session, rover } = context
++  const stats = computeRoverStats(rover)
+ 
+   const batteryAfter = clamp(
+-    rover.battery - estimate.batteryCost,
++    rover.batteryCharge - estimate.batteryCost,
+     MIN_BATTERY,
+-    MAX_BATTERY,
++    stats.batteryCapacity,
+   )
+ 
+   const isSuccess = result === 'success'
+   const creditsAwarded = isSuccess ? estimate.reward : 0
+-  const creditsAfter = session.credits + creditsAwarded
++  const balanceCreditsAfter = session.balanceCredits + creditsAwarded
++  const earnedCreditsAfter = session.earnedCredits + creditsAwarded
+   const ratingAfter = clamp(
+-    session.rating + (isSuccess ? RATING_GAIN_ON_SUCCESS : -RATING_LOSS_ON_FAILURE),
++    session.rating +
++      (isSuccess ? RATING_GAIN_ON_SUCCESS : -RATING_LOSS_ON_FAILURE),
+     MIN_RATING,
+     MAX_RATING,
+   )
+ 
+   const sessionStatus = evaluateSessionStatus({
+-    credits: creditsAfter,
++    earnedCredits: earnedCreditsAfter,
+     targetCredits: session.targetCredits,
+     rating: ratingAfter,
+     minimumRating: session.minimumRating,
+@@ -113,7 +120,8 @@ export function applyDeliveryEffects(
+     result,
+     batteryAfter,
+     creditsAwarded,
+-    creditsAfter,
++    balanceCreditsAfter,
++    earnedCreditsAfter,
+     ratingAfter,
+     orderStatus: isSuccess ? 'completed' : 'failed',
+     roverStatus: 'idle',
+diff --git a/src/domain/roverStats.ts b/src/domain/roverStats.ts
+new file mode 100644
+index 0000000..136db5e
+--- /dev/null
++++ b/src/domain/roverStats.ts
+@@ -0,0 +1,37 @@
++/**
++ * Effective rover characteristics.
++ *
++ * Game Design v2 introduced per-attribute upgrade levels. The effective value
++ * of an attribute is the base value scaled by a fixed step per level:
++ *
++ *   effective = base * (1 + level * ROVER_UPGRADE_STEP)
++ *
++ * At level 0 the effective value equals the base value, so an un-upgraded rover
++ * behaves exactly like it did before v2. This module is pure: no React, Prisma,
++ * randomness or time.
++ */
++
++import { ROVER_UPGRADE_STEP } from './constants'
++import { assertFinite } from './errors'
++import { roundToInt } from './math'
++import type { Rover, RoverStats } from './types'
++
++function upgradeMultiplier(level: number): number {
++  assertFinite(level, 'rover upgrade level')
++  const safeLevel = level < 0 ? 0 : level
++  return 1 + safeLevel * ROVER_UPGRADE_STEP
++}
++
++/** Computes the effective rover characteristics from its base stats + levels. */
++export function computeRoverStats(rover: Rover): RoverStats {
++  return {
++    capacity: roundToInt(
++      rover.capacity * upgradeMultiplier(rover.capacityLevel),
++    ),
++    speed: rover.speed * upgradeMultiplier(rover.speedLevel),
++    efficiency: rover.efficiency * upgradeMultiplier(rover.efficiencyLevel),
++    batteryCapacity: roundToInt(
++      rover.batteryCapacity * upgradeMultiplier(rover.batteryLevel),
++    ),
++  }
++}
+diff --git a/src/domain/rules.ts b/src/domain/rules.ts
+index 140c163..babf6e8 100644
+--- a/src/domain/rules.ts
++++ b/src/domain/rules.ts
+@@ -3,8 +3,14 @@
+  *
+  * The reasons are returned as a stable, deterministic list so that both the
+  * preview endpoint and the start endpoint report identical explanations.
++ *
++ * Game Design v2: capacity and battery checks run on the effective rover stats
++ * (`computeRoverStats`). The two battery reasons are mutually exclusive:
++ * ROUTE_EXCEEDS_CAPACITY means the route is impossible even fully charged,
++ * INSUFFICIENT_CHARGE means only the current charge is too low.
+  */
+ 
++import { computeRoverStats } from './roverStats'
+ import type {
+   DeliveryBlockReason,
+   DeliveryContext,
+@@ -23,6 +29,7 @@ export function evaluateDeliveryEligibility(
+   flags: EligibilityFlags = {},
+ ): DeliveryEligibility {
+   const { session, order, rover } = context
++  const stats = computeRoverStats(rover)
+   const reasons: DeliveryBlockReason[] = []
+ 
+   if (session.status !== 'active') {
+@@ -37,12 +44,14 @@ export function evaluateDeliveryEligibility(
+     reasons.push('ROVER_NOT_IDLE')
+   }
+ 
+-  if (order.weight > rover.capacity) {
++  if (order.weight > stats.capacity) {
+     reasons.push('CAPACITY_EXCEEDED')
+   }
+ 
+-  if (estimate.batteryCost > rover.battery) {
+-    reasons.push('INSUFFICIENT_BATTERY')
++  if (estimate.batteryCost > stats.batteryCapacity) {
++    reasons.push('ROUTE_EXCEEDS_CAPACITY')
++  } else if (estimate.batteryCost > rover.batteryCharge) {
++    reasons.push('INSUFFICIENT_CHARGE')
+   }
+ 
+   if (order.deadlineDay < session.currentDay) {
+diff --git a/src/domain/types.ts b/src/domain/types.ts
+index a87e112..e6b2c04 100644
+--- a/src/domain/types.ts
++++ b/src/domain/types.ts
+@@ -19,7 +19,9 @@ export const ROVER_STATUSES = [
+ ] as const
+ export type RoverStatus = (typeof ROVER_STATUSES)[number]
+ 
+-export const ORDER_URGENCIES = ['low', 'medium', 'critical'] as const
++// Game Design v2: urgency values were renamed from low | medium | critical.
++// The DTO layer still exposes the legacy values for temporary compatibility.
++export const ORDER_URGENCIES = ['normal', 'urgent', 'critical'] as const
+ export type OrderUrgency = (typeof ORDER_URGENCIES)[number]
+ 
+ export const ORDER_STATUSES = [
+@@ -34,6 +36,12 @@ export type OrderStatus = (typeof ORDER_STATUSES)[number]
+ export const DELIVERY_RESULTS = ['success', 'failed'] as const
+ export type DeliveryResult = (typeof DELIVERY_RESULTS)[number]
+ 
++// Game Design v2: a delivery now has a lifecycle. In this first iteration the
++// delivery is still resolved immediately, so a persisted delivery is always
++// "completed" or "failed"; "in_transit" is reserved for the next iteration.
++export const DELIVERY_STATUSES = ['in_transit', 'completed', 'failed'] as const
++export type DeliveryStatus = (typeof DELIVERY_STATUSES)[number]
++
+ export const GAME_EVENT_TYPES = [
+   'delivery_success',
+   'delivery_failed',
+@@ -59,6 +67,7 @@ export const isRoverStatus = createGuard(ROVER_STATUSES)
+ export const isOrderUrgency = createGuard(ORDER_URGENCIES)
+ export const isOrderStatus = createGuard(ORDER_STATUSES)
+ export const isDeliveryResult = createGuard(DELIVERY_RESULTS)
++export const isDeliveryStatus = createGuard(DELIVERY_STATUSES)
+ export const isGameEventType = createGuard(GAME_EVENT_TYPES)
+ 
+ /** Active game run. */
+@@ -66,7 +75,10 @@ export type GameSession = {
+   readonly id: string
+   readonly currentDay: number
+   readonly maxDays: number
+-  readonly credits: number
++  /** Spendable wallet. Rewards are added here; upgrades will be paid from here. */
++  readonly balanceCredits: number
++  /** Lifetime credits earned. Never decreases; the win condition checks this. */
++  readonly earnedCredits: number
+   readonly targetCredits: number
+   readonly rating: number
+   readonly minimumRating: number
+@@ -92,20 +104,56 @@ export type MoonLocation = {
+   readonly riskBonus: number
+ }
+ 
++/**
++ * A rover.
++ *
++ * Game Design v2 split `battery` into `batteryCharge` (current) and
++ * `batteryCapacity` (maximum before upgrades). `capacity`, `speed`,
++ * `efficiency` and `batteryCapacity` are BASE values; the effective values used
++ * by every calculation come from `computeRoverStats` applied on top of the
++ * per-attribute upgrade levels.
++ */
+ export type Rover = {
+   readonly id: string
+   readonly name: string
+-  /** Battery charge in percent points (0-100). */
+-  readonly battery: number
+-  /** Cargo capacity in kilograms. */
++  /** Current battery charge in percent points. */
++  readonly batteryCharge: number
++  /** Base maximum battery charge in percent points (before the battery upgrade). */
++  readonly batteryCapacity: number
++  /** Base cargo capacity in kilograms. */
+   readonly capacity: number
+-  /** Speed in km/h. */
++  /** Base speed in km/h. */
+   readonly speed: number
+-  /** Efficiency multiplier, higher means less battery per km. */
++  /** Base efficiency multiplier, higher means less battery per km. */
+   readonly efficiency: number
++  /** Cargo-capacity upgrade level (0 = no upgrade). */
++  readonly capacityLevel: number
++  /** Speed upgrade level (0 = no upgrade). */
++  readonly speedLevel: number
++  /** Efficiency upgrade level (0 = no upgrade). */
++  readonly efficiencyLevel: number
++  /** Battery-capacity upgrade level (0 = no upgrade). */
++  readonly batteryLevel: number
+   readonly status: RoverStatus
+ }
+ 
++/**
++ * Effective rover characteristics after upgrades.
++ *
++ * Every delivery calculation (battery cost, duration, risk) and every
++ * eligibility rule uses these effective values instead of the raw base ones.
++ */
++export type RoverStats = {
++  /** Effective cargo capacity in kilograms. */
++  readonly capacity: number
++  /** Effective speed in km/h. */
++  readonly speed: number
++  /** Effective efficiency multiplier. */
++  readonly efficiency: number
++  /** Effective maximum battery charge in percent points. */
++  readonly batteryCapacity: number
++}
++
+ export type Order = {
+   readonly id: string
+   readonly title: string
+@@ -143,12 +191,18 @@ export type DeliveryEstimate = {
+   readonly reward: number
+ }
+ 
++// Game Design v2 split the single battery reason into two:
++// - CAPACITY_EXCEEDED: the cargo weight is heavier than the effective capacity;
++// - ROUTE_EXCEEDS_CAPACITY: the route needs more charge than the battery can
++//   ever hold (impossible even fully charged);
++// - INSUFFICIENT_CHARGE: the current charge is too low right now.
+ export const DELIVERY_BLOCK_REASONS = [
+   'SESSION_FINISHED',
+   'ORDER_NOT_AVAILABLE',
+   'ROVER_NOT_IDLE',
+   'CAPACITY_EXCEEDED',
+-  'INSUFFICIENT_BATTERY',
++  'ROUTE_EXCEEDS_CAPACITY',
++  'INSUFFICIENT_CHARGE',
+   'DEADLINE_PASSED',
+   'DUPLICATE_REQUEST',
+ ] as const
+@@ -162,9 +216,13 @@ export type DeliveryEligibility = {
+ /** State changes produced by one resolved delivery. */
+ export type DeliveryEffects = {
+   readonly result: DeliveryResult
++  /** Rover battery charge after the delivery. */
+   readonly batteryAfter: number
+   readonly creditsAwarded: number
+-  readonly creditsAfter: number
++  /** Spendable balance after the reward was applied. */
++  readonly balanceCreditsAfter: number
++  /** Lifetime earned credits after the reward was applied. */
++  readonly earnedCreditsAfter: number
+   readonly ratingAfter: number
+   readonly orderStatus: OrderStatus
+   readonly roverStatus: RoverStatus
+diff --git a/src/infrastructure/clock.ts b/src/infrastructure/clock.ts
+new file mode 100644
+index 0000000..d175180
+--- /dev/null
++++ b/src/infrastructure/clock.ts
+@@ -0,0 +1,13 @@
++import 'server-only'
++
++/** Centralised server-side clock (injectable for deterministic tests). */
++
++import type { Clock } from '@/application/ports'
++
++export function createSystemClock(): Clock {
++  return {
++    now(): Date {
++      return new Date()
++    },
++  }
++}
+diff --git a/src/infrastructure/container.ts b/src/infrastructure/container.ts
+index 539087e..ff53b9c 100644
+--- a/src/infrastructure/container.ts
++++ b/src/infrastructure/container.ts
+@@ -8,6 +8,7 @@ import 'server-only'
+  */
+ 
+ import type { ServiceDeps } from '@/application/ports'
++import { createSystemClock } from './clock'
+ import { createUuidGenerator } from './ids'
+ import { createServerRandomSource } from './random'
+ import { createUnitOfWork } from './unitOfWork'
+@@ -20,6 +21,7 @@ export function getServiceDeps(): ServiceDeps {
+       uow: createUnitOfWork(),
+       random: createServerRandomSource(),
+       ids: createUuidGenerator(),
++      clock: createSystemClock(),
+     }
+   }
+ 
+diff --git a/src/infrastructure/mappers.ts b/src/infrastructure/mappers.ts
+index e33fdd0..a219e78 100644
+--- a/src/infrastructure/mappers.ts
++++ b/src/infrastructure/mappers.ts
+@@ -12,6 +12,7 @@ import 'server-only'
+ import { z } from 'zod'
+ import {
+   DELIVERY_RESULTS,
++  DELIVERY_STATUSES,
+   GAME_EVENT_TYPES,
+   ORDER_STATUSES,
+   ORDER_URGENCIES,
+@@ -19,19 +20,15 @@ import {
+   SESSION_STATUSES,
+   ZONE_TYPES,
+ } from '@/domain/types'
+-import type {
+-  GameSession,
+-  MoonLocation,
+-  Order,
+-  Rover,
+-} from '@/domain/types'
++import type { GameSession, MoonLocation, Order, Rover } from '@/domain/types'
+ import type { DeliveryRecord, GameEventRecord } from '@/application/ports'
+ 
+ const sessionRowSchema = z.object({
+   id: z.string(),
+   currentDay: z.number().int(),
+   maxDays: z.number().int(),
+-  credits: z.number().int(),
++  balanceCredits: z.number().int(),
++  earnedCredits: z.number().int(),
+   targetCredits: z.number().int(),
+   rating: z.number().int(),
+   minimumRating: z.number().int(),
+@@ -53,10 +50,15 @@ const locationRowSchema = z.object({
+ const roverRowSchema = z.object({
+   id: z.string(),
+   name: z.string(),
+-  battery: z.number().int(),
++  batteryCharge: z.number().int(),
++  batteryCapacity: z.number().int(),
+   capacity: z.number().int(),
+   speed: z.number(),
+   efficiency: z.number(),
++  capacityLevel: z.number().int(),
++  speedLevel: z.number().int(),
++  efficiencyLevel: z.number().int(),
++  batteryLevel: z.number().int(),
+   status: z.enum(ROVER_STATUSES),
+ })
+ 
+@@ -82,7 +84,10 @@ const deliveryRowSchema = z.object({
+   calculatedRisk: z.number().int(),
+   calculatedDuration: z.number().int(),
+   reward: z.number().int(),
+-  result: z.enum(DELIVERY_RESULTS),
++  status: z.enum(DELIVERY_STATUSES),
++  startedAt: z.date(),
++  completesAt: z.date(),
++  result: z.enum(DELIVERY_RESULTS).nullable(),
+   idempotencyKey: z.string(),
+   createdAt: z.date(),
+ })
+@@ -117,7 +122,11 @@ function parseMetadata(raw: string | null): Record<string, unknown> | null {
+ 
+   try {
+     const parsed: unknown = JSON.parse(raw)
+-    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
++    if (
++      typeof parsed === 'object' &&
++      parsed !== null &&
++      !Array.isArray(parsed)
++    ) {
+       return parsed as Record<string, unknown>
+     }
+     return null
+diff --git a/src/infrastructure/repositories.ts b/src/infrastructure/repositories.ts
+index f32eed7..a3a7d2c 100644
+--- a/src/infrastructure/repositories.ts
++++ b/src/infrastructure/repositories.ts
+@@ -33,9 +33,7 @@ import {
+   toRover,
+ } from './mappers'
+ 
+-export function createRepositories(
+-  client: PrismaClientLike,
+-): GameRepositories {
++export function createRepositories(client: PrismaClientLike): GameRepositories {
+   return {
+     async findActiveSession(): Promise<GameSession | null> {
+       const row = await client.gameSession.findFirst({
+@@ -49,7 +47,8 @@ export function createRepositories(
+         where: { id },
+         data: {
+           currentDay: patch.currentDay,
+-          credits: patch.credits,
++          balanceCredits: patch.balanceCredits,
++          earnedCredits: patch.earnedCredits,
+           rating: patch.rating,
+           status: patch.status,
+         },
+@@ -94,7 +93,7 @@ export function createRepositories(
+     async updateRover(id: string, patch: RoverPatch): Promise<void> {
+       await client.rover.update({
+         where: { id },
+-        data: { battery: patch.battery, status: patch.status },
++        data: { batteryCharge: patch.batteryCharge, status: patch.status },
+       })
+     },
+ 
+@@ -130,6 +129,9 @@ export function createRepositories(
+           calculatedRisk: input.calculatedRisk,
+           calculatedDuration: input.calculatedDuration,
+           reward: input.reward,
++          status: input.status,
++          startedAt: input.startedAt,
++          completesAt: input.completesAt,
+           result: input.result,
+           idempotencyKey: input.idempotencyKey,
+         },
+@@ -174,7 +176,14 @@ export function createRepositories(
+       await client.delivery.deleteMany({})
+       await client.order.updateMany({ data: { status: 'available' } })
+       await client.rover.updateMany({
+-        data: { status: 'idle', battery: input.roverBattery },
++        data: {
++          status: 'idle',
++          batteryCharge: input.roverBatteryCharge,
++          capacityLevel: 0,
++          speedLevel: 0,
++          efficiencyLevel: 0,
++          batteryLevel: 0,
++        },
+       })
+ 
+       const row = await client.gameSession.upsert({
+@@ -182,7 +191,8 @@ export function createRepositories(
+         update: {
+           currentDay: input.session.currentDay,
+           maxDays: input.session.maxDays,
+-          credits: input.session.credits,
++          balanceCredits: input.session.balanceCredits,
++          earnedCredits: input.session.earnedCredits,
+           targetCredits: input.session.targetCredits,
+           rating: input.session.rating,
+           minimumRating: input.session.minimumRating,
+@@ -192,7 +202,8 @@ export function createRepositories(
+           id: input.session.id,
+           currentDay: input.session.currentDay,
+           maxDays: input.session.maxDays,
+-          credits: input.session.credits,
++          balanceCredits: input.session.balanceCredits,
++          earnedCredits: input.session.earnedCredits,
+           targetCredits: input.session.targetCredits,
+           rating: input.session.rating,
+           minimumRating: input.session.minimumRating,
+diff --git a/src/shared/messages.ts b/src/shared/messages.ts
+index 1a41e1d..03fc8d3 100644
+--- a/src/shared/messages.ts
++++ b/src/shared/messages.ts
+@@ -7,8 +7,8 @@
+ 
+ import type {
+   DeliveryBlockReason,
++  DeliveryStatus,
+   OrderStatus,
+-  OrderUrgency,
+   RoverStatus,
+   SessionStatus,
+   ZoneType,
+@@ -19,7 +19,9 @@ export const BLOCK_REASON_MESSAGES: Record<DeliveryBlockReason, string> = {
+   ORDER_NOT_AVAILABLE: 'Заказ недоступен для доставки',
+   ROVER_NOT_IDLE: 'Ровер сейчас не готов к выезду',
+   CAPACITY_EXCEEDED: 'Вес груза превышает грузоподъёмность ровера',
+-  INSUFFICIENT_BATTERY: 'Недостаточно заряда для этого маршрута',
++  ROUTE_EXCEEDS_CAPACITY:
++    'Маршрут требует больше заряда, чем вмещает батарея ровера',
++  INSUFFICIENT_CHARGE: 'Недостаточно текущего заряда для этого маршрута',
+   DEADLINE_PASSED: 'Срок доставки уже истёк',
+   DUPLICATE_REQUEST: 'Эта доставка уже была запущена',
+ }
+@@ -30,7 +32,13 @@ export const ZONE_LABELS: Record<ZoneType, string> = {
+   dark: 'Темная зона',
+ }
+ 
+-export const URGENCY_LABELS: Record<OrderUrgency, string> = {
++// Game Design v2 renamed the internal urgency values, but the DTO layer still
++// exposes the legacy values (low | medium | critical) for backward
++// compatibility, so these labels stay keyed by the legacy DTO values.
++export const DTO_ORDER_URGENCIES = ['low', 'medium', 'critical'] as const
++export type DtoOrderUrgency = (typeof DTO_ORDER_URGENCIES)[number]
++
++export const URGENCY_LABELS: Record<DtoOrderUrgency, string> = {
+   low: 'Обычный',
+   medium: 'Средний',
+   critical: 'Критичный',
+@@ -44,6 +52,12 @@ export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
+   expired: 'Просрочен',
+ }
+ 
++export const DELIVERY_STATUS_LABELS: Record<DeliveryStatus, string> = {
++  in_transit: 'В пути',
++  completed: 'Выполнена',
++  failed: 'Провалена',
++}
++
+ export const ROVER_STATUS_LABELS: Record<RoverStatus, string> = {
+   idle: 'Готов',
+   delivering: 'В рейсе',
+diff --git a/tests/integration/startDelivery.test.ts b/tests/integration/startDelivery.test.ts
+index a90c380..64edb2f 100644
+--- a/tests/integration/startDelivery.test.ts
++++ b/tests/integration/startDelivery.test.ts
+@@ -2,8 +2,8 @@
+  * Integration test for the delivery use case.
+  *
+  * It runs the real application service against in-memory repositories with a
+- * transaction boundary, an injected random source and injected ids. No Prisma,
+- * no HTTP, no timers: fully deterministic.
++ * transaction boundary, an injected random source, injected ids and an injected
++ * clock. No Prisma, no HTTP, no timers: fully deterministic.
+  */
+ 
+ import { beforeEach, describe, expect, it } from 'vitest'
+@@ -17,6 +17,7 @@ import type {
+   UnitOfWork,
+ } from '../../src/application/ports'
+ import {
++  createFixedClock,
+   createFixedRolls,
+   createSequentialIds,
+   createTestStore,
+@@ -32,13 +33,13 @@ import {
+ 
+ function initialState(): StoreState {
+   return {
+-    session: makeSession({ credits: 500 }),
++    session: makeSession({ balanceCredits: 500, earnedCredits: 0 }),
+     orders: [
+       makeOrder({ id: 'order-light', weight: 10, reward: 300 }),
+       makeOrder({ id: 'order-heavy', weight: 90, reward: 1200 }),
+       makeOrder({ id: 'order-expiring', deadlineDay: 1, reward: 200 }),
+     ],
+-    rovers: [makeRover({ id: 'rover-a', capacity: 40, battery: 100 })],
++    rovers: [makeRover({ id: 'rover-a', capacity: 40, batteryCharge: 100 })],
+     locations: [makePlain()],
+     deliveries: [],
+     events: [],
+@@ -50,6 +51,7 @@ function makeDeps(store: TestStore, rolls: readonly number[]): ServiceDeps {
+     uow: store.uow,
+     random: createFixedRolls(rolls),
+     ids: createSequentialIds(),
++    clock: createFixedClock(),
+   }
+ }
+ 
+@@ -80,6 +82,7 @@ function makeFailingEventDeps(store: TestStore): ServiceDeps {
+     uow: failingUow,
+     random: createFixedRolls([0.99]),
+     ids: createSequentialIds(),
++    clock: createFixedClock(),
+   }
+ }
+ 
+@@ -103,9 +106,10 @@ describe('startDelivery', () => {
+     expect(result.result).toBe('success')
+     expect(result.creditsAwarded).toBe(300)
+     expect(result.replayed).toBe(false)
+-    expect(store.state.session.credits).toBe(800)
++    expect(store.state.session.balanceCredits).toBe(800)
++    expect(store.state.session.earnedCredits).toBe(300)
+     expect(store.state.deliveries).toHaveLength(1)
+-    expect(store.state.rovers[0]?.battery).toBeLessThan(100)
++    expect(store.state.rovers[0]?.batteryCharge).toBeLessThan(100)
+     expect(store.state.orders[0]?.status).toBe('completed')
+     expect(store.state.events.map((event) => event.type)).toContain(
+       'delivery_success',
+@@ -124,7 +128,8 @@ describe('startDelivery', () => {
+ 
+     expect(result.result).toBe('failed')
+     expect(result.creditsAwarded).toBe(0)
+-    expect(store.state.session.credits).toBe(500)
++    expect(store.state.session.balanceCredits).toBe(500)
++    expect(store.state.session.earnedCredits).toBe(0)
+     expect(store.state.session.rating).toBeLessThan(100)
+     expect(store.state.orders[0]?.status).toBe('failed')
+   })
+@@ -138,7 +143,7 @@ describe('startDelivery', () => {
+     }
+ 
+     const first = await startDelivery(deps, input)
+-    const creditsAfterFirst = store.state.session.credits
++    const creditsAfterFirst = store.state.session.balanceCredits
+ 
+     const second = await startDelivery(deps, input)
+ 
+@@ -147,7 +152,7 @@ describe('startDelivery', () => {
+     expect(second.deliveryId).toBe(first.deliveryId)
+     expect(second.creditsAwarded).toBe(0)
+     expect(store.state.deliveries).toHaveLength(1)
+-    expect(store.state.session.credits).toBe(creditsAfterFirst)
++    expect(store.state.session.balanceCredits).toBe(creditsAfterFirst)
+   })
+ 
+   it('rejects an order heavier than the rover and keeps the state untouched', async () => {
+@@ -162,8 +167,8 @@ describe('startDelivery', () => {
+     ).rejects.toBeInstanceOf(AppError)
+ 
+     expect(store.state.deliveries).toHaveLength(0)
+-    expect(store.state.session.credits).toBe(500)
+-    expect(store.state.rovers[0]?.battery).toBe(100)
++    expect(store.state.session.balanceCredits).toBe(500)
++    expect(store.state.rovers[0]?.batteryCharge).toBe(100)
+   })
+ 
+   it('rolls back every write when a step fails inside the transaction', async () => {
+@@ -179,9 +184,9 @@ describe('startDelivery', () => {
+ 
+     // Delivery, credits, battery and order status must all be rolled back.
+     expect(store.state.deliveries).toHaveLength(0)
+-    expect(store.state.session.credits).toBe(500)
++    expect(store.state.session.balanceCredits).toBe(500)
+     expect(store.state.session.rating).toBe(100)
+-    expect(store.state.rovers[0]?.battery).toBe(100)
++    expect(store.state.rovers[0]?.batteryCharge).toBe(100)
+     expect(store.state.orders[0]?.status).toBe('available')
+     expect(store.state.events).toHaveLength(0)
+   })
+diff --git a/tests/support/fixtures.ts b/tests/support/fixtures.ts
+index 21dc411..64d9abd 100644
+--- a/tests/support/fixtures.ts
++++ b/tests/support/fixtures.ts
+@@ -16,7 +16,8 @@ export function makeSession(overrides: Partial<GameSession> = {}): GameSession {
+     id: 'session-test',
+     currentDay: 1,
+     maxDays: 7,
+-    credits: 500,
++    balanceCredits: 500,
++    earnedCredits: 0,
+     targetCredits: 4000,
+     rating: 100,
+     minimumRating: 60,
+@@ -69,10 +70,15 @@ export function makeRover(overrides: Partial<Rover> = {}): Rover {
+   return {
+     id: 'rover-test',
+     name: 'Test-01',
+-    battery: 100,
++    batteryCharge: 100,
++    batteryCapacity: 100,
+     capacity: 40,
+     speed: 5,
+     efficiency: 1,
++    capacityLevel: 0,
++    speedLevel: 0,
++    efficiencyLevel: 0,
++    batteryLevel: 0,
+     status: 'idle',
+     ...overrides,
+   }
+@@ -86,7 +92,7 @@ export function makeOrder(overrides: Partial<Order> = {}): Order {
+     locationId: 'loc-plain',
+     weight: 10,
+     reward: 300,
+-    urgency: 'medium',
++    urgency: 'urgent',
+     baseRisk: 10,
+     deadlineDay: 5,
+     status: 'available',
+diff --git a/tests/support/inMemoryRepositories.ts b/tests/support/inMemoryRepositories.ts
+index d16f07b..acba5eb 100644
+--- a/tests/support/inMemoryRepositories.ts
++++ b/tests/support/inMemoryRepositories.ts
+@@ -8,6 +8,7 @@
+  */
+ 
+ import type {
++  Clock,
+   CreateDeliveryInput,
+   CreateEventInput,
+   DeliveryRecord,
+@@ -167,7 +168,7 @@ function createRepositories(store: { state: StoreState }): GameRepositories {
+ 
+     async restartGame(input: {
+       session: SessionDefaults
+-      roverBattery: number
++      roverBatteryCharge: number
+     }): Promise<GameSession> {
+       store.state.deliveries = []
+       store.state.events = []
+@@ -177,7 +178,11 @@ function createRepositories(store: { state: StoreState }): GameRepositories {
+       }))
+       store.state.rovers = store.state.rovers.map((rover) => ({
+         ...rover,
+-        battery: input.roverBattery,
++        batteryCharge: input.roverBatteryCharge,
++        capacityLevel: 0,
++        speedLevel: 0,
++        efficiencyLevel: 0,
++        batteryLevel: 0,
+         status: 'idle',
+       }))
+       store.state.session = { ...input.session, status: 'active' }
+@@ -235,3 +240,13 @@ export function createSequentialIds(prefix = 'id'): IdGenerator {
+     },
+   }
+ }
++
++/** Clock returning a fixed instant, so durations are deterministic in tests. */
++export function createFixedClock(iso = '2026-01-01T00:00:00.000Z'): Clock {
++  const fixed = new Date(iso)
++  return {
++    now(): Date {
++      return new Date(fixed.getTime())
++    },
++  }
++}
+diff --git a/tests/unit/endDay.test.ts b/tests/unit/endDay.test.ts
+index c756896..dd80050 100644
+--- a/tests/unit/endDay.test.ts
++++ b/tests/unit/endDay.test.ts
+@@ -33,7 +33,7 @@ describe('resolveEndOfDay', () => {
+ 
+     const normal = resolveEndOfDay({
+       session,
+-      orders: [makeOrder({ id: 'a', deadlineDay: 2, urgency: 'low' })],
++      orders: [makeOrder({ id: 'a', deadlineDay: 2, urgency: 'normal' })],
+       rovers: [],
+     })
+     const critical = resolveEndOfDay({
+@@ -53,9 +53,9 @@ describe('resolveEndOfDay', () => {
+       session: makeSession({ currentDay: 1 }),
+       orders: [],
+       rovers: [
+-        makeRover({ id: 'low', battery: 10, status: 'idle' }),
+-        makeRover({ id: 'full', battery: MAX_BATTERY, status: 'idle' }),
+-        makeRover({ id: 'busy', battery: 20, status: 'delivering' }),
++        makeRover({ id: 'low', batteryCharge: 10, status: 'idle' }),
++        makeRover({ id: 'full', batteryCharge: MAX_BATTERY, status: 'idle' }),
++        makeRover({ id: 'busy', batteryCharge: 20, status: 'delivering' }),
+       ],
+     })
+ 
+@@ -66,7 +66,7 @@ describe('resolveEndOfDay', () => {
+ 
+   it('requirement 15: losing the last day ends the game', () => {
+     const outcome = resolveEndOfDay({
+-      session: makeSession({ currentDay: 7, maxDays: 7, credits: 100 }),
++      session: makeSession({ currentDay: 7, maxDays: 7, earnedCredits: 100 }),
+       orders: [],
+       rovers: [],
+     })
+@@ -91,7 +91,7 @@ describe('resolveEndOfDay', () => {
+ 
+   it('requirement 14: reaching the goal wins even at the end of a day', () => {
+     const outcome = resolveEndOfDay({
+-      session: makeSession({ currentDay: 3, credits: 4200 }),
++      session: makeSession({ currentDay: 3, earnedCredits: 4200 }),
+       orders: [],
+       rovers: [],
+     })
+diff --git a/tests/unit/outcome.test.ts b/tests/unit/outcome.test.ts
+index a2e4133..82ae2bd 100644
+--- a/tests/unit/outcome.test.ts
++++ b/tests/unit/outcome.test.ts
+@@ -57,13 +57,17 @@ describe('applyDeliveryEffects', () => {
+     const effects = applyDeliveryEffects(current, estimate, 'success')
+ 
+     expect(effects.creditsAwarded).toBe(400)
+-    expect(effects.creditsAfter).toBe(current.session.credits + 400)
++    expect(effects.balanceCreditsAfter).toBe(
++      current.session.balanceCredits + 400,
++    )
++    expect(effects.earnedCreditsAfter).toBe(current.session.earnedCredits + 400)
+     expect(effects.orderStatus).toBe('completed')
+ 
+     // Re-applying the same pure function does not accumulate a second reward:
+     // the calculation always starts from the reloaded session state.
+     const repeated = applyDeliveryEffects(current, estimate, 'success')
+-    expect(repeated.creditsAfter).toBe(effects.creditsAfter)
++    expect(repeated.balanceCreditsAfter).toBe(effects.balanceCreditsAfter)
++    expect(repeated.earnedCreditsAfter).toBe(effects.earnedCreditsAfter)
+   })
+ 
+   it('requirement 11: a failure adds no reward and lowers the rating', () => {
+@@ -73,21 +77,22 @@ describe('applyDeliveryEffects', () => {
+     const effects = applyDeliveryEffects(current, estimate, 'failed')
+ 
+     expect(effects.creditsAwarded).toBe(0)
+-    expect(effects.creditsAfter).toBe(current.session.credits)
++    expect(effects.balanceCreditsAfter).toBe(current.session.balanceCredits)
++    expect(effects.earnedCreditsAfter).toBe(current.session.earnedCredits)
+     expect(effects.orderStatus).toBe('failed')
+     expect(effects.ratingAfter).toBeLessThan(current.session.rating)
+   })
+ 
+   it('requirement 9: the battery never becomes negative', () => {
+     const current = context({
+-      rover: makeRover({ battery: 3 }),
++      rover: makeRover({ batteryCharge: 3 }),
+       location: makePlain({ distance: 88, batteryModifier: 1.7 }),
+     })
+     const estimate = calculateDeliveryEstimate(current)
+ 
+     const effects = applyDeliveryEffects(current, estimate, 'success')
+ 
+-    expect(estimate.batteryCost).toBeGreaterThan(current.rover.battery)
++    expect(estimate.batteryCost).toBeGreaterThan(current.rover.batteryCharge)
+     expect(effects.batteryAfter).toBe(MIN_BATTERY)
+   })
+ 
+@@ -105,7 +110,7 @@ describe('applyDeliveryEffects', () => {
+ 
+ describe('evaluateSessionStatus', () => {
+   const base = {
+-    credits: 500,
++    earnedCredits: 500,
+     targetCredits: 4000,
+     rating: 100,
+     minimumRating: 60,
+@@ -118,8 +123,8 @@ describe('evaluateSessionStatus', () => {
+   })
+ 
+   it('requirement 14: detects the win condition', () => {
+-    expect(evaluateSessionStatus({ ...base, credits: 4000 })).toBe('won')
+-    expect(evaluateSessionStatus({ ...base, credits: 4200 })).toBe('won')
++    expect(evaluateSessionStatus({ ...base, earnedCredits: 4000 })).toBe('won')
++    expect(evaluateSessionStatus({ ...base, earnedCredits: 4200 })).toBe('won')
+   })
+ 
+   it('requirement 15: detects the lose conditions', () => {
+@@ -129,7 +134,7 @@ describe('evaluateSessionStatus', () => {
+ 
+   it('gives the rating collapse precedence over the credits goal', () => {
+     expect(
+-      evaluateSessionStatus({ ...base, credits: 5000, rating: 10 }),
++      evaluateSessionStatus({ ...base, earnedCredits: 5000, rating: 10 }),
+     ).toBe('lost')
+   })
+ })
+diff --git a/tests/unit/rules.test.ts b/tests/unit/rules.test.ts
+index 615c04a..d291de7 100644
+--- a/tests/unit/rules.test.ts
++++ b/tests/unit/rules.test.ts
+@@ -50,23 +50,37 @@ describe('evaluateDeliveryEligibility', () => {
+     expect(eligibility.reasons).toContain('CAPACITY_EXCEEDED')
+   })
+ 
+-  it('requirement 3: rejects a route the battery cannot cover', () => {
++  it('requirement 3: rejects a route that exceeds the battery capacity', () => {
++    // cost = ceil((88 * 1.7 + 10 * 0.25) / 1) = 153 > capacity 100
+     const eligibility = evaluate(
+       baseContext({
+-        rover: makeRover({ battery: 5 }),
++        rover: makeRover({ batteryCharge: 5 }),
+         location: makePlain({ distance: 88, batteryModifier: 1.7 }),
+       }),
+     )
+ 
+     expect(eligibility.canStart).toBe(false)
+-    expect(eligibility.reasons).toContain('INSUFFICIENT_BATTERY')
++    expect(eligibility.reasons).toContain('ROUTE_EXCEEDS_CAPACITY')
++    expect(eligibility.reasons).not.toContain('INSUFFICIENT_CHARGE')
++  })
++
++  it('requirement 3b: rejects a route the current charge cannot cover', () => {
++    // cost = ceil((20 * 1 + 10 * 0.25) / 1) = 23, below capacity 100 but above 5
++    const eligibility = evaluate(
++      baseContext({
++        rover: makeRover({ batteryCharge: 5 }),
++        location: makePlain({ distance: 20, batteryModifier: 1 }),
++      }),
++    )
++
++    expect(eligibility.canStart).toBe(false)
++    expect(eligibility.reasons).toContain('INSUFFICIENT_CHARGE')
++    expect(eligibility.reasons).not.toContain('ROUTE_EXCEEDS_CAPACITY')
+   })
+ 
+   it('requirement 4: rejects a rover that is not idle', () => {
+     for (const status of ['delivering', 'charging', 'damaged'] as const) {
+-      const eligibility = evaluate(
+-        baseContext({ rover: makeRover({ status }) }),
+-      )
++      const eligibility = evaluate(baseContext({ rover: makeRover({ status }) }))
+ 
+       expect(eligibility.canStart).toBe(false)
+       expect(eligibility.reasons).toContain('ROVER_NOT_IDLE')
+@@ -131,11 +145,12 @@ describe('evaluateDeliveryEligibility', () => {
+   })
+ 
+   it('reports every blocker at once', () => {
++    // cost = ceil((20 * 1 + 90 * 0.25) / 1) = 43, below capacity 100 but above 1
+     const eligibility = evaluate(
+       baseContext({
+         session: makeSession({ status: 'lost', currentDay: 6 }),
+         order: makeOrder({ status: 'expired', weight: 90, deadlineDay: 2 }),
+-        rover: makeRover({ status: 'damaged', capacity: 20, battery: 1 }),
++        rover: makeRover({ status: 'damaged', capacity: 20, batteryCharge: 1 }),
+       }),
+     )
+ 
+@@ -144,7 +159,7 @@ describe('evaluateDeliveryEligibility', () => {
+       'ORDER_NOT_AVAILABLE',
+       'ROVER_NOT_IDLE',
+       'CAPACITY_EXCEEDED',
+-      'INSUFFICIENT_BATTERY',
++      'INSUFFICIENT_CHARGE',
+       'DEADLINE_PASSED',
+     ])
+   })

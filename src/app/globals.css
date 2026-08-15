@@ -1,0 +1,252 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens taken from the v0 visual reference (lunnyj-kurer).
+ *
+ * The v0 prototype ran on Tailwind v4 (`@theme inline`). The working project
+ * stays on Tailwind v3, so the tokens live here as plain CSS variables and are
+ * mapped to utility names in `tailwind.config.ts`.
+ */
+:root {
+  color-scheme: dark;
+
+  --background: oklch(0.17 0.006 250);
+  --foreground: oklch(0.97 0.003 250);
+  --panel: oklch(0.215 0.007 250);
+  --card: oklch(0.225 0.008 250);
+  --primary: oklch(0.72 0.17 52);
+  --primary-foreground: oklch(0.16 0.02 52);
+  --secondary: oklch(0.28 0.008 250);
+  --muted: oklch(0.28 0.008 250);
+  --muted-foreground: oklch(0.68 0.007 250);
+  --border: oklch(1 0 0 / 9%);
+  --ring: oklch(0.72 0.17 52);
+
+  /* moon-courier custom tokens */
+  --moon-surface: oklch(0.42 0.006 250);
+  --moon-surface-2: oklch(0.36 0.006 250);
+  --route: oklch(0.7 0.13 235);
+  --success: oklch(0.72 0.16 150);
+  --danger: oklch(0.64 0.2 25);
+  --contract: oklch(0.78 0.14 75);
+
+  --radius: 0.5rem;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+}
+
+/* Visible keyboard focus for every interactive element. */
+:focus-visible {
+  @apply outline outline-2 outline-offset-2;
+  outline-color: var(--ring);
+}
+
+/*
+ * Space backdrop around the game frame.
+ *
+ * Pure CSS: a deep blue base, two faint nebula clouds and three star layers
+ * built from repeating radial gradients. No external GIF, no video, no canvas
+ * and no extra requests. The layers sit behind the frame and are kept low in
+ * contrast so panel text is never harder to read.
+ */
+.mcc-space {
+  position: relative;
+  background:
+    radial-gradient(
+      ellipse 70% 50% at 22% 18%,
+      oklch(0.32 0.07 265 / 0.5) 0%,
+      transparent 60%
+    ),
+    radial-gradient(
+      ellipse 60% 45% at 80% 78%,
+      oklch(0.3 0.06 300 / 0.4) 0%,
+      transparent 62%
+    ),
+    radial-gradient(ellipse 120% 90% at 50% 0%, oklch(0.19 0.03 262) 0%, transparent 70%),
+    linear-gradient(180deg, oklch(0.13 0.025 265) 0%, oklch(0.1 0.02 268) 100%);
+}
+
+/* Star layers. Each layer twinkles at its own slow pace. */
+.mcc-space::before,
+.mcc-space::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Stars stay behind every panel because the panels paint their own opaque
+     backgrounds on top; no explicit z-index is needed and a negative one would
+     push the layer behind the container background and hide it. */
+}
+
+.mcc-space::before {
+  background-image:
+    radial-gradient(1.4px 1.4px at 12% 22%, oklch(0.98 0.01 250 / 0.85) 50%, transparent 51%),
+    radial-gradient(1.2px 1.2px at 68% 12%, oklch(0.96 0.01 250 / 0.7) 50%, transparent 51%),
+    radial-gradient(1.6px 1.6px at 84% 62%, oklch(0.98 0.02 240 / 0.8) 50%, transparent 51%),
+    radial-gradient(1.1px 1.1px at 32% 78%, oklch(0.95 0.01 250 / 0.65) 50%, transparent 51%),
+    radial-gradient(1.3px 1.3px at 54% 46%, oklch(0.97 0.02 60 / 0.6) 50%, transparent 51%);
+  background-repeat: repeat;
+  background-size: 320px 320px;
+  /* only opacity animates; the stars never move */
+  animation: mcc-twinkle-a 7s ease-in-out infinite;
+  animation-delay: -2s;
+}
+
+.mcc-space::after {
+  background-image:
+    radial-gradient(1px 1px at 8% 64%, oklch(0.92 0.01 250 / 0.55) 50%, transparent 51%),
+    radial-gradient(0.9px 0.9px at 44% 8%, oklch(0.9 0.01 250 / 0.45) 50%, transparent 51%),
+    radial-gradient(1px 1px at 74% 36%, oklch(0.93 0.01 250 / 0.5) 50%, transparent 51%),
+    radial-gradient(0.8px 0.8px at 92% 88%, oklch(0.9 0.01 250 / 0.4) 50%, transparent 51%),
+    radial-gradient(1px 1px at 24% 40%, oklch(0.92 0.02 240 / 0.45) 50%, transparent 51%),
+    radial-gradient(0.9px 0.9px at 60% 84%, oklch(0.9 0.01 250 / 0.4) 50%, transparent 51%);
+  background-repeat: repeat;
+  background-size: 210px 210px;
+  /* only opacity animates; the stars never move */
+  animation: mcc-twinkle-b 11s ease-in-out infinite;
+  animation-delay: -5s;
+}
+
+@keyframes mcc-twinkle-a {
+  0%,
+  100% {
+    opacity: 0.75;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes mcc-twinkle-b {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+/*
+ * Map liveliness. Every effect is a small CSS animation on an SVG element:
+ * no canvas, no WebGL, no library.
+ */
+
+/* Slow pulsing ring around a station with an active delivery. */
+.mcc-station-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mcc-station-pulse 2.6s ease-in-out infinite;
+}
+
+@keyframes mcc-station-pulse {
+  0%,
+  100% {
+    opacity: 0.65;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.15;
+    transform: scale(1.28);
+  }
+}
+
+/* Soft breathing glow under a highlighted route. */
+.mcc-route-glow {
+  animation: mcc-route-glow 3.4s ease-in-out infinite;
+}
+
+@keyframes mcc-route-glow {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* Small dashes travelling along an active route. */
+.mcc-route-flow {
+  animation: mcc-route-flow 1.6s linear infinite;
+}
+
+@keyframes mcc-route-flow {
+  from {
+    stroke-dashoffset: 10;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Faint halo around the moving rover module. */
+.mcc-rover-halo {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mcc-rover-halo 2s ease-in-out infinite;
+}
+
+@keyframes mcc-rover-halo {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.12);
+  }
+}
+
+/* A faint, STATIC light gradient on the lunar surface. It used to translate
+   across the map, which read as a moving rectangle, so the motion is removed
+   (the map now has no moving fills). */
+.mcc-surface-sweep {
+  opacity: 0.5;
+}
+
+/*
+ * Accessibility: users who ask for reduced motion get the same visuals without
+ * any movement or blinking. The starfield, glows and rings stay, frozen.
+ */
+/* Delivery-finished toast: a short slide + fade in. */
+@keyframes mcc-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.mcc-toast {
+  animation: mcc-toast-in 0.18s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mcc-space::before,
+  .mcc-space::after,
+  .mcc-station-pulse,
+  .mcc-route-glow,
+  .mcc-route-flow,
+  .mcc-rover-halo,
+  .mcc-surface-sweep,
+  .mcc-toast {
+    animation: none !important;
+  }
+
+  .mcc-space::before {
+    opacity: 0.9;
+  }
+
+  .mcc-space::after {
+    opacity: 0.7;
+  }
+}

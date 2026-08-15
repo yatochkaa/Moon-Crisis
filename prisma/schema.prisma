@@ -1,0 +1,172 @@
+// Moon Courier Crisis — database schema.
+//
+// NOTE ON ENUMS: SQLite (via Prisma) does not support native enums, therefore
+// every enum-like column is stored as TEXT. The allowed values are enforced in
+// the domain layer (type guards in src/domain/types.ts) and in the Zod schemas
+// used by the infrastructure mappers. See docs/architecture.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model GameSession {
+  id            String   @id
+  currentDay    Int
+  maxDays       Int
+  /// Spendable balance. Rewards are added here; upgrades will be paid from here.
+  balanceCredits Int
+  /// Lifetime credits earned. Never decreases; the win condition checks this.
+  earnedCredits Int
+  targetCredits Int
+  rating        Int
+  minimumRating Int
+  /// Deliveries started today; resets to 0 at the start of each day.
+  operationsToday Int @default(0)
+  /// SessionStatus: "active" | "won" | "lost"
+  status        String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  deliveries Delivery[]
+  events     GameEvent[]
+}
+
+model Location {
+  id              String   @id
+  name            String   @unique
+  /// Map coordinate for the SVG placeholder map (viewBox units).
+  x               Int
+  y               Int
+  /// Distance from the base in kilometres.
+  distance        Float
+  /// ZoneType: "plain" | "crater" | "dark"
+  zoneType        String
+  batteryModifier Float
+  speedModifier   Float
+  /// Additional risk in percentage points.
+  riskBonus       Int
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orders Order[]
+}
+
+model Rover {
+  id              String   @id
+  name            String   @unique
+  /// Current battery charge in percent points.
+  batteryCharge   Int
+  /// Base maximum battery charge in percent points (before the battery upgrade).
+  batteryCapacity Int
+  /// Base cargo capacity in kilograms.
+  capacity        Int
+  /// Base travel speed in km/hour.
+  speed           Float
+  /// Base battery efficiency multiplier (higher is better).
+  efficiency      Float
+  /// Cargo-capacity upgrade level (0 = no upgrade).
+  capacityLevel   Int      @default(0)
+  /// Speed upgrade level (0 = no upgrade).
+  speedLevel      Int      @default(0)
+  /// Efficiency upgrade level (0 = no upgrade).
+  efficiencyLevel Int      @default(0)
+  /// Battery-capacity upgrade level (0 = no upgrade).
+  batteryLevel    Int      @default(0)
+  /// Safety upgrade level (0 = no upgrade).
+  safetyLevel     Int      @default(0)
+  /// RoverStatus: "idle" | "delivering" | "charging" | "damaged"
+  status          String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  deliveries Delivery[]
+}
+
+model Order {
+  id          String   @id
+  title       String
+  description String
+  locationId  String
+  /// Cargo weight in kilograms.
+  weight      Int
+  /// Reward in credits.
+  reward      Int
+  /// OrderUrgency: "normal" | "urgent" | "critical"
+  urgency     String
+  /// Base risk in percentage points.
+  baseRisk    Int
+  /// Last game day on which the order may still be delivered.
+  deadlineDay Int
+  /// Whether the order is a challenge contract (does not lower rating on expiry).
+  isChallenge Boolean @default(false)
+  /// OrderStatus: "available" | "in_progress" | "completed" | "failed" | "expired"
+  status      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  location   Location   @relation(fields: [locationId], references: [id])
+  deliveries Delivery[]
+
+  @@index([status])
+  @@index([locationId])
+}
+
+model Delivery {
+  id                    String   @id
+  gameSessionId         String
+  roverId               String
+  orderId               String
+  /// Battery points charged for this delivery (server-calculated).
+  calculatedBatteryCost Int
+  /// Risk in percentage points (server-calculated, 0-90).
+  calculatedRisk        Int
+  /// Duration in whole hours (server-calculated).
+  calculatedDuration    Int
+  /// Reward in credits copied from the order at start time.
+  reward                Int
+  /// DeliveryStatus: "in_transit" | "completed" | "failed"
+  status                String
+  /// When the delivery started (server clock).
+  startedAt             DateTime
+  /// When the delivery is expected to complete (startedAt + duration hours).
+  completesAt           DateTime
+  /// DeliveryResult: "success" | "failed". Null while a delivery is in transit.
+  result                String?
+  /// Client-supplied key protecting against double submits.
+  idempotencyKey        String   @unique
+  createdAt             DateTime @default(now())
+
+  gameSession GameSession @relation(fields: [gameSessionId], references: [id], onDelete: Cascade)
+  rover       Rover       @relation(fields: [roverId], references: [id])
+  order       Order       @relation(fields: [orderId], references: [id])
+  events      GameEvent[]
+
+  @@index([gameSessionId])
+  @@index([orderId])
+  @@index([roverId])
+}
+
+model GameEvent {
+  id            String   @id
+  gameSessionId String
+  deliveryId    String?
+  /// GameEventType, see src/domain/types.ts
+  type          String
+  title         String
+  description   String
+  /// Optional JSON payload serialised as TEXT (SQLite has no JSON column type).
+  metadata      String?
+  /// Game day on which the event happened.
+  day           Int
+  createdAt     DateTime @default(now())
+
+  gameSession GameSession @relation(fields: [gameSessionId], references: [id], onDelete: Cascade)
+  delivery    Delivery?   @relation(fields: [deliveryId], references: [id], onDelete: SetNull)
+
+  @@index([gameSessionId, createdAt])
+}
