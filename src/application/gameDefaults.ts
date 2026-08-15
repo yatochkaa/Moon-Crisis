@@ -29,9 +29,3 @@ export const DEFAULT_ROVER_BATTERY_CHARGE = 100
 
 /** Base coordinates for the SVG placeholder map (viewBox units). */
 export const BASE_POSITION = { x: 40, y: 40 } as const
-
-/**
- * Fixed real-time length of one delivery in the vertical slice, in seconds.
- * The countdown and the marker animation both run for this many seconds.
- */
-export const DELIVERY_SIMULATION_SECONDS = 15

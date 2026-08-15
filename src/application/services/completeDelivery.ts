@@ -85,6 +85,12 @@ export async function completeDelivery(
       }
     }
 
+    if (deps.clock.now().getTime() < delivery.completesAt.getTime()) {
+      throw new AppError('DELIVERY_NOT_READY', {
+        details: { completesAt: delivery.completesAt.toISOString() },
+      })
+    }
+
     const location = await repositories.findLocationById(order.locationId)
     if (location === null) {
       throw new AppError('LOCATION_NOT_FOUND')

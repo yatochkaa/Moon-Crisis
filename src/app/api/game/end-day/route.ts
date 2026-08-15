@@ -1,7 +1,7 @@
 import { endDay } from '@/application/services/endDay'
 import { endDayInputSchema, parseInput } from '@/application/schemas'
 import { getServiceDeps } from '@/infrastructure/container'
-import { jsonError, jsonOk } from '@/presentation/http'
+import { jsonError, jsonOk, readJsonBody } from '@/presentation/http'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -13,8 +13,7 @@ export const dynamic = 'force-dynamic'
  */
 export async function POST(request: Request): Promise<Response> {
   try {
-    const body: unknown = await request.json().catch(() => ({}))
-    const input = parseInput(endDayInputSchema, body ?? {})
+    const input = parseInput(endDayInputSchema, await readJsonBody(request))
     const result = await endDay(getServiceDeps(), input)
     return jsonOk(result)
   } catch (error) {

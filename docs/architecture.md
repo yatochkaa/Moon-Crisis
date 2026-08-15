@@ -14,7 +14,7 @@
 | `errors.ts` | `DomainInvariantError`, проверки инвариантов |
 | `calculations.ts` | расход батареи, длительность, риск, полный estimate |
 | `rules.ts` | причины, по которым доставка невозможна |
-| `outcome.ts` | результат по `roll`, эффекты доставки, победа/поражение |
+| `outcome.ts` | результат по `roll`, эффекты завершённой доставки, победа/поражение |
 | `endDay.ts` | завершение дня: просрочки, штрафы рейтинга, подзарядка |
 
 Запрещено: React, Prisma, Next.js, `fetch`, `Math.random`, `Date.now`, чтение окружения. Функции детерминированы: одинаковый вход → одинаковый выход.
@@ -25,14 +25,17 @@
 
 | Файл | Содержимое |
 | --- | --- |
-| `ports.ts` | интерфейсы `GameRepositories`, `UnitOfWork`, `RandomSource`, `IdGenerator` |
+| `ports.ts` | интерфейсы `GameRepositories`, `UnitOfWork`, `RandomSource`, `IdGenerator`, `Clock` |
 | `schemas.ts` | Zod-схемы входных данных (`strict`) |
 | `dto.ts` | DTO и мапперы domain → DTO |
 | `errors.ts` | `AppError`, коды, HTTP-статусы, русские сообщения |
 | `gameDefaults.ts` | детерминированная стартовая конфигурация |
 | `services/getGameState.ts` | состояние игры для UI |
 | `services/previewDelivery.ts` | информационный расчёт |
-| `services/startDelivery.ts` | транзакционный запуск доставки |
+| `services/startDelivery.ts` | транзакционный запуск рейса и списание батареи |
+| `services/completeDelivery.ts` | серверное завершение готового рейса, результат и награда |
+| `services/chargeRover.ts` | покупка зарядки ровера |
+| `services/purchaseUpgrade.ts` | покупка улучшения ровера |
 | `services/endDay.ts` | завершение дня |
 | `services/resetGame.ts` | сброс тестовой сессии (под флагом) |
 
@@ -80,32 +83,35 @@ Presentation ──▶ Application ──▶ Domain
 - `import 'server-only'` в `infrastructure/prisma.ts` ломает сборку при попытке импортировать Prisma в client-компонент;
 - `domain/` физически не содержит импортов вне себя.
 
-## Схема запроса: запуск доставки
+### Application service flow: start and complete delivery
 
-```
-Браузер (кнопка «Запустить доставку», disabled при busy)
-  │  POST /api/deliveries { orderId, roverId, idempotencyKey }
+```text
+Браузер (кнопка «Запустить доставку»)
+  │ POST /api/deliveries { orderId, roverId, idempotencyKey }
   ▼
 Route Handler src/app/api/deliveries/route.ts
-  │ 1. readJsonBody
-  │ 2. startDeliverySchema.parse (Zod, strict)
-  │ 3. getServiceDeps()
-  │ 4. startDelivery(deps, input)
+  │ readJsonBody → strict Zod → getServiceDeps → startDelivery
   ▼
-Application service startDelivery (внутри uow.transaction)
-  │ перезагрузка session/order/rover/location
-  │ проверка idempotencyKey (replay → сохранённый результат)
-  │ calculateDeliveryEstimate  ─────▶ Domain
-  │ evaluateDeliveryEligibility ────▶ Domain
-  │ random.nextFloat() → resolveDeliveryResult ─▶ Domain
-  │ applyDeliveryEffects ───────────▶ Domain
-  │ createDelivery / updateRover / updateOrderStatus /
-  │ updateSession / createEvent ────▶ Infrastructure (Prisma)
+Application service startDelivery (uow.transaction)
+  │ reload session/order/rover/location
+  │ calculateDeliveryEstimate → Domain
+  │ evaluateDeliveryEligibility → Domain
+  │ createDelivery(in_transit, startedAt, completesAt)
+  │ updateRover(battery, delivering), updateOrderStatus(in_progress)
   ▼
-DTO (DeliveryResultDto)
-  │  HTTP 201 (новая доставка) или 200 (replay)
+Браузер: показывает таймер, карту и блокировку завершения дня
+  │ после server completesAt → POST /api/deliveries/complete { deliveryId }
   ▼
-Браузер: показывает результат и перезапрашивает GET /api/game
+Route Handler src/app/api/deliveries/complete/route.ts
+  │ readJsonBody → strict Zod → completeDelivery
+  ▼
+Application service completeDelivery (uow.transaction)
+  │ проверка server clock >= completesAt
+  │ random.nextFloat → resolveDeliveryResult → Domain
+  │ applyDeliveryEffects → Domain
+  │ update delivery/order/rover/session, create events
+  ▼
+DTO → UI показывает результат; повторный completion возвращает сохранённый результат
 ```
 
 Ошибка на любом шаге → `AppError` → единый JSON `{ error: { code, message, details } }` и откат транзакции.
@@ -141,8 +147,7 @@ DTO (DeliveryResultDto)
   - `RoverDto.battery = batteryCharge` (+ `batteryCharge`, `batteryCapacity`,
     уровни улучшений и `stats: RoverStats`);
   - `OrderDto.urgency` — легаси-значения через `URGENCY_TO_DTO`.
-- Презентационные компоненты (`StatusBar`, `RoverList`, `OrderList`) не
-  меняются и продолжают читать `credits`, `battery`, `urgency`.
+- Презентационные компоненты читают актуальные DTO, а `components/useGame.ts` управляет клиентским состоянием.
 
 ### Инфраструктура
 - `mappers.ts` и `repositories.ts` работают с новыми колонками; строки

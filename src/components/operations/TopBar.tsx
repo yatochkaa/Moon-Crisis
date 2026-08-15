@@ -211,11 +211,24 @@ export function TopBar({
           data-testid="end-day"
           onClick={onEndDay}
           disabled={busy || isFinished || deliveryInProgress}
+          aria-describedby={
+            deliveryInProgress ? 'end-day-delivery-lock' : undefined
+          }
           className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Завершить день
           <ChevronRightIcon />
         </button>
+        {deliveryInProgress ? (
+          <span
+            id="end-day-delivery-lock"
+            role="status"
+            data-testid="end-day-delivery-lock"
+            className="max-w-40 text-xs leading-tight text-muted-foreground"
+          >
+            Нельзя завершить день: доставка в пути.
+          </span>
+        ) : null}
 
         <button
           type="button"

@@ -76,6 +76,17 @@ function createRepositories(store: { state: StoreState }): GameRepositories {
     },
 
     async createOrders(orders: readonly Order[]): Promise<void> {
+      for (const order of orders) {
+        const clash = store.state.orders.some(
+          (existing) => existing.id === order.id,
+        )
+        if (clash) {
+          // Mirrors the unique constraint on Order.id (Prisma P2002). Without
+          // this guard the integration cycle could silently overwrite a row
+          // and hide an id collision that the real database would reject.
+          throw new Error(`UNIQUE constraint failed: Order.id (${order.id})`)
+        }
+      }
       store.state.orders = [
         ...store.state.orders,
         ...orders.map((order) => ({ ...order })),

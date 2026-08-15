@@ -6,6 +6,7 @@ import {
 } from '../../src/domain/constants'
 import { ceilToInt } from '../../src/domain/math'
 import { resolveEndOfDay } from '../../src/domain/endDay'
+import { CHALLENGE_DEADLINE_DAY } from '../../src/domain/orderGeneration'
 import { makeOrder, makeRover, makeSession } from '../support/fixtures'
 
 describe('resolveEndOfDay', () => {
@@ -28,31 +29,61 @@ describe('resolveEndOfDay', () => {
     expect(outcome.expiredOrderIds).toEqual(['expiring'])
   })
 
-  it('applies urgency-specific expiry penalties (normal -2, critical -10)', () => {
+  it('charges the critical failure for any order left to expire', () => {
+    // An order can only ever expire on the day it is already "due today", so
+    // its live urgency (and its card) is always critical at that point. The
+    // penalty ignores the urgency the order was stored with at creation and
+    // always costs the critical failure (-10), matching what the player sees.
     const session = makeSession({ currentDay: 2, rating: 100 })
 
-    const normal = resolveEndOfDay({
+    const storedNormal = resolveEndOfDay({
       session,
       orders: [makeOrder({ id: 'a', deadlineDay: 2, urgency: 'normal' })],
       rovers: [],
     })
-    const critical = resolveEndOfDay({
+    const storedCritical = resolveEndOfDay({
       session,
       orders: [makeOrder({ id: 'b', deadlineDay: 2, urgency: 'critical' })],
       rovers: [],
     })
 
-    expect(normal.ratingAfter).toBe(100 - RATING_DELTAS.normal.failure)
-    expect(critical.ratingAfter).toBe(100 - RATING_DELTAS.critical.failure)
+    expect(storedNormal.ratingAfter).toBe(100 - RATING_DELTAS.critical.failure)
+    expect(storedCritical.ratingAfter).toBe(100 - RATING_DELTAS.critical.failure)
   })
 
-  it('challenge expiry does NOT lower the rating', () => {
+  it('keeps the permanent contract alive on the very last day', () => {
+    // The permanent contract carries the "delivery is impossible" scenario, so
+    // it must still be on the board whenever someone opens the game.
     const outcome = resolveEndOfDay({
-      session: makeSession({ currentDay: 2, rating: 100 }),
+      session: makeSession({ currentDay: 11, rating: 100 }),
       orders: [
         makeOrder({
           id: 'challenge',
-          deadlineDay: 2,
+          deadlineDay: CHALLENGE_DEADLINE_DAY,
+          urgency: 'normal',
+          isChallenge: true,
+        }),
+        makeOrder({ id: 'regular', deadlineDay: 11, urgency: 'normal' }),
+      ],
+      rovers: [],
+    })
+
+    // Only the regular order expires; the contract survives to the last day.
+    // It lapses on its own deadline day, so it is charged the critical penalty.
+    expect(outcome.expiredOrderIds).toEqual(['regular'])
+    expect(outcome.ratingAfter).toBe(100 - RATING_DELTAS.critical.failure)
+  })
+
+  it('lets a periodic contract expire, but never charges rating for it', () => {
+    // The recurring contract DOES leave the board - that is what keeps the
+    // number of impossible orders varying from day to day. Letting it lapse
+    // must still be free: the player had no way to deliver it.
+    const outcome = resolveEndOfDay({
+      session: makeSession({ currentDay: 3, rating: 100 }),
+      orders: [
+        makeOrder({
+          id: 'challenge',
+          deadlineDay: 3,
           urgency: 'normal',
           isChallenge: true,
         }),
@@ -150,7 +181,7 @@ describe('resolveEndOfDay', () => {
       rovers: [],
     })
 
-    expect(outcome.ratingAfter).toBe(59)
+    expect(outcome.ratingAfter).toBe(51)
     expect(outcome.sessionStatus).toBe('lost')
   })
 })

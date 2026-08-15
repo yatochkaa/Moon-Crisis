@@ -132,13 +132,27 @@ export function useGame(): GameScreenState {
   // Signature of the currently selected rover's live stats. When the player
   // charges or upgrades a rover the server state changes but the selection does
   // not, so the preview must also re-run whenever these numbers move — otherwise
-  // a stale "not enough charge" preview lingers until the rover is reselected.
+  // a stale preview lingers until the rover is reselected.
+  //
+  // It must be built from the EFFECTIVE stats (`rover.stats`), not the base
+  // fields: `capacity`, `speed` and `efficiency` on the DTO are the seeded base
+  // values and never change, so a cargo/speed/efficiency upgrade left the
+  // signature untouched and the preview kept showing the pre-upgrade
+  // "Вес груза превышает грузоподъёмность" until the rover was reselected.
   const selectedRover =
     state?.rovers.find((rover) => rover.id === selectedRoverId) ?? null
   const selectedRoverSignature =
     selectedRover === null
       ? null
-      : `${selectedRover.batteryCharge}/${selectedRover.batteryCapacity}/${selectedRover.capacity}/${selectedRover.speed}/${selectedRover.efficiency}/${selectedRover.status}`
+      : [
+          selectedRover.batteryCharge,
+          selectedRover.stats.batteryCapacity,
+          selectedRover.stats.capacity,
+          selectedRover.stats.efficiency,
+          selectedRover.stats.speedMultiplier,
+          selectedRover.stats.safetyRiskReduction,
+          selectedRover.status,
+        ].join('/')
 
   useEffect(() => {
     if (selectedOrderId === null || selectedRoverId === null) {

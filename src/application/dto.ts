@@ -59,6 +59,7 @@ import type {
   SessionStatus,
   ZoneType,
 } from '@/domain/types'
+import { deriveUrgency } from '@/domain'
 import type { DeliveryRecord, GameEventRecord } from './ports'
 
 /** Maps the new internal urgency values back to the legacy wire values. */
@@ -202,6 +203,8 @@ export type OrderDto = {
   readonly urgency: DtoOrderUrgency
   readonly baseRisk: number
   readonly deadlineDay: number
+  /** Days remaining until the deadline (0 = due today, negative = overdue). */
+  readonly daysLeft: number
   /** True when the order is a challenge contract. */
   readonly isChallenge: boolean
   /** UI label shown for challenge contracts, e.g. «Контракт-вызов». */
@@ -404,6 +407,38 @@ function findReferenceRoute(
 }
 
 /**
+ * A representative route for the speed example: the location that yields the
+ * LONGEST simulated duration for this rover (the farthest / harshest zone).
+ *
+ * The speed example must not run on the cheapest feasible order: a short route
+ * floors at MIN_SIMULATION_SECONDS and renders the upgrade as "8 → 8 секунд",
+ * or disappears entirely when no cheap order is available. A far route keeps
+ * the base above the floor so the bonus is visible and strictly decreasing
+ * (e.g. 40 → 32 → 26). It uses only real map data and never depends on order
+ * feasibility, so the example is present on every level that still sells an
+ * upgrade.
+ */
+function findSpeedExampleLocation(
+  rover: Rover,
+  context: UpgradeExplainContext | undefined,
+): MoonLocation | null {
+  if (context === undefined || context.locations.length === 0) return null
+  let best: MoonLocation | null = null
+  let bestDuration = -1
+  for (const location of context.locations) {
+    const duration = calculateDuration({
+      rover: { speed: rover.speed },
+      location,
+    })
+    if (duration > bestDuration) {
+      bestDuration = duration
+      best = location
+    }
+  }
+  return best
+}
+
+/**
  * Title of an available order that no rover can perform now but this rover
  * could after the upgrade. Uses the same feasibility math as the rules, so the
  * promise shown in the shop always matches what the server will allow.
@@ -532,11 +567,14 @@ function explainUpgrade(
       const reductionPercent = Math.round(
         (1 - SPEED_MULTIPLIER_BASE) * PERCENT_SCALE_FOR_TEXT,
       )
+      // Use a representative (far) route so the bonus is visible; a short
+      // route floors at MIN_SIMULATION_SECONDS and would show "8 → 8 секунд".
+      const exampleLocation = findSpeedExampleLocation(rover, context)
       let example: string | null = null
-      if (route !== null && nextValue !== null) {
+      if (exampleLocation !== null && nextValue !== null) {
         const duration = calculateDuration({
           rover: { speed: rover.speed },
-          location: route.location,
+          location: exampleLocation,
         })
         const before = calculateSimulationSeconds(duration, rover.speedLevel)
         const after = calculateSimulationSeconds(duration, rover.speedLevel + 1)
@@ -665,8 +703,16 @@ export function toRoverDto(
 
 export function toOrderDto(
   order: Order,
+  currentDay: number,
   challenge: { reason: string; hint: string } | null = null,
 ): OrderDto {
+  // Challenge contracts keep their stored urgency; a regular order derives its
+  // urgency live from the days left, so an order carried over from a previous
+  // day ramps up (normal → urgent → critical) as its deadline approaches. This
+  // is why the badge and the "Срок" line can never disagree.
+  const liveUrgency = order.isChallenge
+    ? order.urgency
+    : deriveUrgency(order.deadlineDay, currentDay)
   return {
     id: order.id,
     title: order.title,
@@ -674,9 +720,10 @@ export function toOrderDto(
     locationId: order.locationId,
     weight: order.weight,
     reward: order.reward,
-    urgency: URGENCY_TO_DTO[order.urgency],
+    urgency: URGENCY_TO_DTO[liveUrgency],
     baseRisk: order.baseRisk,
     deadlineDay: order.deadlineDay,
+    daysLeft: order.deadlineDay - currentDay,
     isChallenge: order.isChallenge,
     challengeLabel: order.isChallenge ? 'Контракт-вызов' : null,
     challengeReason: challenge?.reason ?? null,

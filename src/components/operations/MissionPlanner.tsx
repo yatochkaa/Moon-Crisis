@@ -101,6 +101,26 @@ export function MissionPlanner({
     >
       <h2 className="mb-2.5 text-sm font-semibold text-foreground">Новая миссия</h2>
 
+      {/*
+        A blocked challenge contract can now be selected on the board, so the
+        planner must explain WHY it is impossible even before a rover is picked.
+      */}
+      {order !== null && order.isChallenge && order.challengeReason !== null ? (
+        <div
+          data-testid="challenge-block"
+          className="mb-2.5 space-y-1 rounded-md border border-contract/40 bg-contract/10 p-2.5"
+        >
+          <div className="flex items-center gap-2 text-xs font-semibold text-contract">
+            <AlertTriangleIcon size={14} className="shrink-0" />
+            Недостижимый контракт
+          </div>
+          <p className="text-xs text-contract/90">{order.challengeReason}</p>
+          {order.challengeHint !== null ? (
+            <p className="text-xs text-muted-foreground">{order.challengeHint}</p>
+          ) : null}
+        </div>
+      ) : null}
+
       {!isSelectionComplete ? (
         <p className="text-xs text-muted-foreground">
           Выберите заказ и ровер, чтобы увидеть расчёт.

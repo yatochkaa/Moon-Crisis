@@ -35,9 +35,11 @@ import type {
 } from './types'
 
 type BatteryInput = {
-  order: Pick<Order, 'weight'>
+  order: Pick<Order, 'weight'> & { readonly isChallenge?: boolean }
   rover: Pick<RoverStats, 'efficiency'>
-  location: Pick<MoonLocation, 'distance' | 'batteryModifier'>
+  location: Pick<MoonLocation, 'distance' | 'batteryModifier'> & {
+    readonly zoneType?: MoonLocation['zoneType']
+  }
 }
 
 type DurationInput = {
@@ -47,8 +49,28 @@ type DurationInput = {
 
 type RiskInput = {
   order: Pick<Order, 'weight' | 'baseRisk'>
-  rover: Pick<RoverStats, 'capacity'>
+  rover: Pick<RoverStats, 'capacity'> & {
+    readonly safetyRiskReduction?: number
+  }
   location: Pick<MoonLocation, 'riskBonus'>
+}
+
+/**
+ * Extra battery multiplier for the impossible "challenge" contract when it is
+ * routed to a dark-zone location. It pushes the round-trip cost beyond even a
+ * fully-upgraded battery, so the contract is unsolvable by ENERGY (not by cargo
+ * weight) regardless of upgrades. Derived purely from the persisted
+ * `order.isChallenge` flag and the location zone, so it needs no database column.
+ */
+export const CHALLENGE_DARK_ZONE_BATTERY_HAZARD = 3
+
+export function challengeBatteryHazard(
+  order: { readonly isChallenge?: boolean },
+  location: { readonly zoneType?: MoonLocation['zoneType'] },
+): number {
+  return order.isChallenge === true && location.zoneType === 'dark'
+    ? CHALLENGE_DARK_ZONE_BATTERY_HAZARD
+    : 1
 }
 
 /** Battery points required for the round trip, in whole percent points. */
@@ -64,8 +86,9 @@ export function calculateBatteryCost({
 
   const baseDistanceCost = location.distance * location.batteryModifier
   const cargoCost = order.weight * CARGO_BATTERY_COST_PER_KG
+  const hazard = challengeBatteryHazard(order, location)
 
-  return ceilToInt((baseDistanceCost + cargoCost) / rover.efficiency)
+  return ceilToInt(((baseDistanceCost + cargoCost) / rover.efficiency) * hazard)
 }
 
 /** Delivery duration in whole hours. */
@@ -82,11 +105,17 @@ export function calculateRisk({ order, rover, location }: RiskInput): number {
   assertPositive(rover.capacity, 'rover.capacity')
   assertFinite(order.weight, 'order.weight')
   assertFinite(order.baseRisk, 'order.baseRisk')
-  assertFinite(location.riskBonus, 'location.riskBonus')
+  assertFinite(
+    rover.safetyRiskReduction ?? 0,
+    'rover.safetyRiskReduction',
+  )
 
   const loadRatio = order.weight / rover.capacity
   const rawRisk =
-    order.baseRisk + location.riskBonus + loadRatio * LOAD_RATIO_RISK_WEIGHT
+    order.baseRisk +
+    location.riskBonus +
+    loadRatio * LOAD_RATIO_RISK_WEIGHT -
+    (rover.safetyRiskReduction ?? 0)
 
   return clamp(roundToInt(rawRisk), MIN_RISK_PERCENT, MAX_RISK_PERCENT)
 }
@@ -120,11 +149,18 @@ export function calculateSimulationSeconds(
   assertFinite(speedLevel, 'speedLevel')
 
   const level = clamp(speedLevel, 0, MAX_UPGRADE_LEVEL)
-  const raw = ceilToInt(
-    calculatedDurationHours *
-      SIMULATION_SECONDS_PER_HOUR *
-      SPEED_MULTIPLIER_BASE ** level,
-  )
 
-  return clamp(raw, MIN_SIMULATION_SECONDS, MAX_SIMULATION_SECONDS)
+  // The cap is a UX limit on how long the player stares at the animation, so it
+  // must be applied to the BASE duration and the speed bonus applied after it.
+  // Capping the already-multiplied value silently ate the whole upgrade on long
+  // routes: a 49s route clamped to 40s at level 0 and to 40s at level 1 too, so
+  // the shop advertised "-20%" and delivered "40 -> 40 seconds".
+  const base = clamp(
+    ceilToInt(calculatedDurationHours * SIMULATION_SECONDS_PER_HOUR),
+    MIN_SIMULATION_SECONDS,
+    MAX_SIMULATION_SECONDS,
+  )
+  const scaled = ceilToInt(base * SPEED_MULTIPLIER_BASE ** level)
+
+  return clamp(scaled, MIN_SIMULATION_SECONDS, MAX_SIMULATION_SECONDS)
 }

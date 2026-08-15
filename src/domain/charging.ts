@@ -13,7 +13,6 @@
 
 import {
   CHARGE_COST_PER_UNIT,
-  MAX_BATTERY,
   QUICK_CHARGE_AMOUNT,
 } from './constants'
 import { computeRoverStats } from './roverStats'
@@ -106,9 +105,3 @@ export function evaluateCharge(
  * offer ("up to N units, at most M credits") without duplicating the numbers.
  */
 export const QUICK_CHARGE_MAX_COST = QUICK_CHARGE_AMOUNT * CHARGE_COST_PER_UNIT
-
-/**
- * Price of topping a fresh, empty default rover up to the base capacity. Used
- * only for documentation and tests; real prices always come from evaluateCharge.
- */
-export const FULL_CHARGE_BASE_COST = MAX_BATTERY * CHARGE_COST_PER_UNIT

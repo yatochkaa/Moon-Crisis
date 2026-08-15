@@ -27,6 +27,36 @@ type Props = {
   disabled: boolean
 }
 
+/**
+ * Stable 32-bit hash (FNV-1a) of an order id.
+ *
+ * Used to interleave the board deterministically: the same order keeps the same
+ * position across re-renders and page reloads, but orders created in sequence
+ * (and the two fixed challenge contracts, which are always generated last) do
+ * not clump together at the bottom of the list.
+ */
+function orderHash(id: string): number {
+  let hash = 2166136261
+  for (let index = 0; index < id.length; index += 1) {
+    hash = Math.imul(hash ^ id.charCodeAt(index), 16777619)
+  }
+  return hash >>> 0
+}
+
+/**
+ * Board order: critical orders first (they expire today, so burying them is a
+ * trap), then everything else shuffled deterministically.
+ */
+function sortForBoard(orders: readonly OrderDto[]): OrderDto[] {
+  return [...orders].sort((a, b) => {
+    const rank = (order: OrderDto): number =>
+      order.status === 'available' && order.urgency === 'critical' ? 0 : 1
+    const byRank = rank(a) - rank(b)
+    if (byRank !== 0) return byRank
+    return orderHash(a.id) - orderHash(b.id)
+  })
+}
+
 function MetaRow({
   icon,
   children,
@@ -57,6 +87,7 @@ export function OrdersPanel({
   const locationNameById = new Map(
     locations.map((location) => [location.id, location.name]),
   )
+  const boardOrders = sortForBoard(orders)
 
   return (
     <aside
@@ -74,11 +105,15 @@ export function OrdersPanel({
           <p className="text-xs text-muted-foreground">Сейчас заказов нет.</p>
         ) : null}
 
-        {orders.map((order) => {
+        {boardOrders.map((order) => {
           const isSelected = order.id === selectedOrderId
-          const isAvailable = order.status === 'available'
           const isCritical = order.urgency === 'critical'
           const isChallenge = order.isChallenge
+          // A challenge contract carries a blocking reason while it cannot be
+          // run. It stays on the board but must not be selectable.
+          const isBlockedChallenge =
+            isChallenge && order.challengeReason !== null
+          const isAvailable = order.status === 'available' && !isBlockedChallenge
 
           const frame = isChallenge
             ? 'border-contract/40 bg-contract/5'
@@ -100,12 +135,15 @@ export function OrdersPanel({
               type="button"
               data-testid={`order-${order.id}`}
               aria-pressed={isSelected}
-              disabled={disabled || !isAvailable}
+              disabled={disabled || (!isAvailable && !isBlockedChallenge)}
               onClick={() => onSelect(order.id)}
               className={[
                 'block w-full rounded-md border p-3 text-left transition-colors',
                 frame,
                 isSelected ? 'ring-1 ring-primary/30' : '',
+                // A blocked challenge stays clickable (so the player can open it
+                // and read WHY it is impossible), just visually dimmed.
+                isBlockedChallenge ? 'cursor-pointer opacity-80 hover:opacity-100' : '',
                 'disabled:cursor-not-allowed disabled:opacity-60',
               ].join(' ')}
             >
@@ -147,37 +185,40 @@ export function OrdersPanel({
                   Риск {order.baseRisk}%
                 </MetaRow>
                 <MetaRow icon={<ClockIcon size={14} />}>
-                  Срок: день {order.deadlineDay}
+                  {order.daysLeft <= 0
+                    ? 'Срок: сегодня'
+                    : order.daysLeft === 1
+                      ? 'Срок: завтра'
+                      : `Срок: день ${order.deadlineDay}`}
                 </MetaRow>
               </div>
 
               <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-2 text-[11px] text-muted-foreground">
                 <span>Срочность: {URGENCY_LABELS[order.urgency]}</span>
-                <span>{ORDER_STATUS_LABELS[order.status]}</span>
+                {/*
+                  A blocked contract is not "available" whatever the raw status
+                  says, so the footer must not claim otherwise. The lock icon
+                  and the dimmed card already carry the message; the full
+                  reason lives in the tooltip instead of four lines of text.
+                */}
+                <span
+                  data-testid={
+                    isBlockedChallenge ? `challenge-${order.id}` : undefined
+                  }
+                  title={
+                    isBlockedChallenge
+                      ? (order.challengeReason ?? undefined)
+                      : undefined
+                  }
+                  className={isBlockedChallenge ? 'text-contract' : undefined}
+                >
+                  {isBlockedChallenge
+                    ? 'Недостижим'
+                    : ORDER_STATUS_LABELS[order.status]}
+                </span>
               </div>
 
-              {isChallenge ? (
-                // Challenge contract: locked, never uses the critical (red)
-                // visual state. Shows the lock, the concrete reason and the
-                // upgrade required to unlock it.
-                <div
-                  data-testid={`challenge-${order.id}`}
-                  className="mt-2 space-y-1 border-t border-contract/25 pt-2 text-xs text-muted-foreground"
-                >
-                  <p className="flex items-center gap-1.5 font-medium text-contract">
-                    <LockIcon size={14} />
-                    {order.challengeLabel ?? 'Контракт-вызов'}
-                  </p>
-                  <p className="uppercase text-contract/80">КОНТРАКТ-ВЫЗОВ</p>
-                  <p>Сейчас недоступен</p>
-                  {order.challengeReason !== null ? (
-                    <p>{order.challengeReason}</p>
-                  ) : null}
-                  {order.challengeHint !== null ? (
-                    <p className="text-contract">{order.challengeHint}</p>
-                  ) : null}
-                </div>
-              ) : isCritical ? (
+              {isCritical && !isChallenge ? (
                 // Critical order: red visual state and the fixed rating stakes.
                 <div
                   data-testid={`critical-${order.id}`}

@@ -3,8 +3,8 @@ import { expect, test } from '@playwright/test'
 /**
  * Minimal happy-path scenario, resilient to the new daily order generation:
  * open the game -> pick the first feasible (order, rover) pair -> see the
- * preview -> start the delivery -> see the result and the updated operation
- * counter.
+ * preview -> start the delivery -> wait for the server-controlled completion
+ * -> see the result and the updated operation counter.
  *
  * Orders are now generated deterministically per day, so their ids change with
  * the seed/day. The test therefore discovers a startable pair from the UI
@@ -62,10 +62,16 @@ test('delivery happy path', async ({ page, request }) => {
   // Starting a delivery counts as one operation for the day.
   await expect(page.getByTestId('operations-today')).toContainText('1/3')
 
+  // The end-day lock is removed only after the server has completed the
+  // delivery and reloaded game state. Then inspect the floating results panel.
+  await expect(page.getByTestId('end-day')).toBeEnabled({ timeout: 45_000 })
+  await page.getByTestId('activity-open').click()
+  await page.getByTestId('activity-tab-results').click()
   await expect(page.getByTestId('recent-results')).toBeVisible()
   await expect(
     page.getByTestId('delivery-result-status').first(),
   ).toContainText(/успех|провал/)
+  await page.getByTestId('activity-tab-journal').click()
   await expect(page.getByTestId('event-log')).toBeVisible()
 
   const creditsAfter = await page.getByTestId('credits').innerText()

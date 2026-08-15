@@ -14,10 +14,11 @@
 import {
   EARLY_END_RATING_PENALTY,
   MAX_ACTIVE_ORDERS,
-  MAX_OPERATIONS_PER_DAY,
   ORDERS_PER_DAY,
+  REQUIRED_OPERATIONS_PER_DAY,
   RATING_DELTAS,
   clamp,
+  deriveUrgency,
   generateDailyOrders,
   resolveEndOfDay,
 } from '@/domain'
@@ -47,7 +48,10 @@ export async function endDay(
     }
 
     // Requirement: fewer than the required operations => confirmation + penalty.
-    const isEarlyEnd = session.operationsToday < MAX_OPERATIONS_PER_DAY
+    // REQUIRED_OPERATIONS_PER_DAY equals the per-day cap (3): the player must
+    // complete the full 3/3 operations to end a day cleanly. Ending with fewer
+    // (0/3, 1/3 or 2/3) needs an explicit confirmation and costs rating.
+    const isEarlyEnd = session.operationsToday < REQUIRED_OPERATIONS_PER_DAY
     if (isEarlyEnd && input.confirmEarlyEnd !== true) {
       throw new AppError('CONFIRMATION_REQUIRED')
     }
@@ -86,22 +90,31 @@ export async function endDay(
     // seed + day, so a refresh recomputes the same orders.
     if (outcome.sessionStatus === 'active') {
       const expiredIds = new Set(outcome.expiredOrderIds)
+      // Challenge contracts are permanent and can never be delivered, so they
+      // must not consume the active-order budget. Counting them would starve
+      // the player of real orders a little more with every passing day.
       const activeCount = orders.filter(
         (order) =>
+          !order.isChallenge &&
           (order.status === 'available' || order.status === 'in_progress') &&
           !expiredIds.has(order.id),
       ).length
       const capacity = clamp(MAX_ACTIVE_ORDERS - activeCount, 0, ORDERS_PER_DAY)
 
-      if (capacity > 0) {
-        const locations = await repositories.listLocations()
-        const newOrders = generateDailyOrders({
-          seed: session.id,
-          day: outcome.nextDay,
-          count: capacity,
-          locations,
-          rovers,
-        })
+      // Generation runs even when `capacity` is 0. The regular batch is capped
+      // by capacity, but the impossible challenge contracts must appear no
+      // matter how full the board is; gating the whole call on capacity used to
+      // let a busy day silently drop the assignment's "delivery is impossible"
+      // scenario. Ids are day-scoped, so no expired challenge row collides.
+      const locations = await repositories.listLocations()
+      const newOrders = generateDailyOrders({
+        seed: session.id,
+        day: outcome.nextDay,
+        count: capacity,
+        locations,
+        rovers,
+      })
+      if (newOrders.length > 0) {
         await repositories.createOrders(newOrders)
       }
     }
@@ -114,7 +127,10 @@ export async function endDay(
       description:
         `Наступил день ${outcome.nextDay} из ${session.maxDays}. ` +
         `Просрочено заказов: ${outcome.expiredOrderIds.length}. ` +
-        `Роверы подзаряжены: ${outcome.batteryUpdates.length}.`,
+        `Роверы подзаряжены: ${outcome.batteryUpdates.length}.` +
+        (earlyEndPenalty > 0
+          ? ` Досрочное завершение (меньше ${REQUIRED_OPERATIONS_PER_DAY}/${REQUIRED_OPERATIONS_PER_DAY} операций): −${earlyEndPenalty} рейтинга.`
+          : ''),
       metadata: { expiredOrderIds: outcome.expiredOrderIds },
       day: outcome.nextDay,
     })
@@ -130,7 +146,12 @@ export async function endDay(
     )
     for (const order of expiredOrders) {
       if (order.isChallenge) continue
-      const ratingPenalty = RATING_DELTAS[order.urgency].failure
+      // Same live-urgency rule as the domain penalty above: an order that
+      // reaches expiry is shown as "critical / due today", so it always costs
+      // the critical failure penalty (-10).
+      const ratingPenalty =
+        RATING_DELTAS[deriveUrgency(order.deadlineDay, session.currentDay)]
+          .failure
       await repositories.createEvent({
         id: deps.ids.next(),
         gameSessionId: session.id,

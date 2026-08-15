@@ -13,6 +13,7 @@ import { completeDelivery } from '../../src/application/services/completeDeliver
 import { endDay } from '../../src/application/services/endDay'
 import { previewDelivery } from '../../src/application/services/previewDelivery'
 import { startDelivery } from '../../src/application/services/startDelivery'
+import { CHALLENGE_DEADLINE_DAY } from '../../src/domain/orderGeneration'
 import type {
   GameRepositories,
   ServiceDeps,
@@ -57,6 +58,19 @@ function makeDeps(store: TestStore, rolls: readonly number[]): ServiceDeps {
     random: createFixedRolls(rolls),
     ids: createSequentialIds(),
     clock: createFixedClock(),
+  }
+}
+
+function makeDepsAt(
+  store: TestStore,
+  rolls: readonly number[],
+  iso: string,
+): ServiceDeps {
+  return {
+    uow: store.uow,
+    random: createFixedRolls(rolls),
+    ids: createSequentialIds(),
+    clock: createFixedClock(iso),
   }
 }
 
@@ -254,10 +268,39 @@ describe('completeDelivery', () => {
     })
   }
 
+  it('rejects completion before the server-side completion time without changing state', async () => {
+    const startDeps = makeDeps(store, [0.99])
+    const active = await startActive(startDeps)
+    const stateBeforeAttempt = structuredClone(store.state)
+
+    await expect(
+      completeDelivery(startDeps, { deliveryId: active.deliveryId }),
+    ).rejects.toMatchObject({
+      code: 'DELIVERY_NOT_READY',
+      details: { completesAt: active.completesAt },
+    })
+
+    expect(store.state).toEqual(stateBeforeAttempt)
+  })
+
+  it('allows completion at the server-side completion time', async () => {
+    const startDeps = makeDeps(store, [0.99])
+    const active = await startActive(startDeps)
+    const completionDeps = makeDepsAt(store, [0.99], active.completesAt)
+
+    const result = await completeDelivery(completionDeps, {
+      deliveryId: active.deliveryId,
+    })
+
+    expect(result.result).toBe('success')
+    expect(result.replayed).toBe(false)
+  })
+
   it('requirements 5, 6, 8 and 9: resolves a success once and pays the reward once', async () => {
     // roll 0.99 is far above the risk threshold -> success (consumed at completion)
-    const deps = makeDeps(store, [0.99])
-    const active = await startActive(deps)
+    const startDeps = makeDeps(store, [0.99])
+    const active = await startActive(startDeps)
+    const deps = makeDepsAt(store, [0.99], active.completesAt)
     const chargeAfterStart = store.state.rovers[0]?.batteryCharge
 
     const result = await completeDelivery(deps, { deliveryId: active.deliveryId })
@@ -291,8 +334,9 @@ describe('completeDelivery', () => {
 
   it('requirement 7: resolves a failure without paying', async () => {
     // roll 0.0 is always below the risk threshold -> failure
-    const deps = makeDeps(store, [0])
-    const active = await startActive(deps)
+    const startDeps = makeDeps(store, [0])
+    const active = await startActive(startDeps)
+    const deps = makeDepsAt(store, [0], active.completesAt)
 
     const result = await completeDelivery(deps, { deliveryId: active.deliveryId })
 
@@ -373,13 +417,18 @@ describe('parallel deliveries', () => {
 
     // Complete them one after another, as the client does when several
     // countdowns finish at once.
-    const resultA = await completeDelivery(deps, {
+    const completionDeps = makeDepsAt(
+      parallelStore,
+      [0.99],
+      startedA.completesAt,
+    )
+    const resultA = await completeDelivery(completionDeps, {
       deliveryId: startedA.deliveryId,
     })
-    const resultB = await completeDelivery(deps, {
+    const resultB = await completeDelivery(completionDeps, {
       deliveryId: startedB.deliveryId,
     })
-    const resultC = await completeDelivery(deps, {
+    const resultC = await completeDelivery(completionDeps, {
       deliveryId: startedC.deliveryId,
     })
 
@@ -432,7 +481,7 @@ describe('endDay', () => {
     expect(store.state.events.map((event) => event.type)).toContain('day_ended')
   })
 
-  it('emits one order_expired event per expiring order; two critical cost 20, challenge costs nothing', async () => {
+  it('emits one order_expired event per expiring order; two critical cost 20, challenge never expires', async () => {
     const expiryStore = createTestStore({
       session: makeSession({ rating: 100, operationsToday: 3 }),
       orders: [
@@ -442,7 +491,7 @@ describe('endDay', () => {
           id: 'chal',
           title: 'Chal',
           urgency: 'normal',
-          deadlineDay: 1,
+          deadlineDay: CHALLENGE_DEADLINE_DAY,
           isChallenge: true,
         }),
       ],
@@ -466,9 +515,11 @@ describe('endDay', () => {
     )
     expect(expiredEvents).toHaveLength(2)
 
-    // The challenge simply expires (not failed) without a penalty event.
+    // The challenge contract is permanent: it stays on the board past its
+    // nominal deadline so the player can come back to it on any later day.
     expect(
       expiryStore.state.orders.find((order) => order.id === 'chal')?.status,
-    ).toBe('expired')
+    ).toBe('available')
+    expect(result.expiredOrderIds).not.toContain('chal')
   })
 })

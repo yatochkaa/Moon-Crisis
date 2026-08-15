@@ -21,15 +21,16 @@ import {
   CARGO_CAPACITY_PER_LEVEL,
   MAX_RISK_PERCENT,
   MAX_UPGRADE_LEVEL,
+  MIN_ORDERS_PER_DAY,
   ORDER_BASE_RISK,
   ORDER_BASE_WEIGHT,
   ORDER_LIFETIME_DAYS,
+  ORDER_MAX_LIFETIME_DAYS,
   ORDER_MIN_WEIGHT,
   ORDER_RISK_JITTER,
   ORDER_RISK_PER_DAY,
   ORDER_WEIGHT_JITTER,
   ORDER_WEIGHT_PER_DAY,
-  ORDERS_PER_DAY,
   PERCENT_SCALE,
   REWARD_DAY_GROWTH,
   REWARD_PER_KG,
@@ -54,14 +55,6 @@ const CARGO_NAMES = [
   'Питьевая вода',
   'Комплектующие',
 ] as const
-
-/** Urgency cycle per slot; guarantees a mix of deadlines every day. */
-const URGENCY_BY_SLOT: readonly OrderUrgency[] = [
-  'normal',
-  'urgent',
-  'critical',
-  'normal',
-]
 
 // --- Deterministic PRNG (xmur3 seed + mulberry32 stream) --------------------
 
@@ -118,15 +111,17 @@ export function calculateOrderReward(input: {
 
 /** True when at least one rover in the fleet can currently perform the order. */
 export function isOrderFeasible(
-  order: Pick<Order, 'weight'>,
+  order: Pick<Order, 'weight'> & { readonly isChallenge?: boolean },
   location: MoonLocation,
   rovers: readonly Rover[],
 ): boolean {
   return rovers.some((rover) => {
     const stats = computeRoverStats(rover)
     if (order.weight > stats.capacity) return false
+    // The challenge flag must be forwarded, otherwise the dark-zone battery
+    // hazard is silently dropped and an impossible contract looks feasible.
     const cost = calculateBatteryCost({
-      order: { weight: order.weight },
+      order: { weight: order.weight, isChallenge: order.isChallenge },
       rover: { efficiency: stats.efficiency },
       location,
     })
@@ -165,6 +160,14 @@ type BuildInput = {
   baseRisk: number
   rng: () => number
   isChallenge?: boolean
+  /** Stable id override, used by the permanent challenge contracts. */
+  id?: string
+  /** Title override, used by the permanent challenge contracts. */
+  title?: string
+  /** Description override, used by the permanent challenge contracts. */
+  description?: string
+  /** Deadline override; challenge contracts never expire. */
+  deadlineDay?: number
 }
 
 function makeOrderRecord(input: BuildInput): Order {
@@ -183,15 +186,18 @@ function makeOrderRecord(input: BuildInput): Order {
   })
 
   return {
-    id: `order-d${input.day}-s${input.slot}`,
-    title: `${cargo} → ${input.location.name}`,
-    description: `Груз дня ${input.day}. Пункт назначения: ${input.location.name}.`,
+    id: input.id ?? `order-d${input.day}-s${input.slot}`,
+    title: input.title ?? `${cargo} → ${input.location.name}`,
+    description:
+      input.description ??
+      `Груз дня ${input.day}. Пункт назначения: ${input.location.name}.`,
     locationId: input.location.id,
     weight: input.weight,
     reward,
     urgency: input.urgency,
     baseRisk: input.baseRisk,
-    deadlineDay: input.day + ORDER_LIFETIME_DAYS[input.urgency] - 1,
+    deadlineDay:
+      input.deadlineDay ?? input.day + ORDER_LIFETIME_DAYS[input.urgency] - 1,
     isChallenge: input.isChallenge ?? false,
     status: 'available',
   }
@@ -244,6 +250,7 @@ function buildFeasibleOrder(
   assignedIndex: number,
   rovers: readonly Rover[],
   rng: () => number,
+  deadlineDay: number,
 ): Order {
   // Keep the assigned zone; only fall back toward the base when even a minimum
   // cargo cannot reach it with the current fleet (feasibility safety net).
@@ -273,7 +280,7 @@ function buildFeasibleOrder(
     60,
   )
 
-  return makeOrderRecord({ seed, day, slot, urgency, location, weight, baseRisk, rng })
+  return makeOrderRecord({ seed, day, slot, urgency, location, weight, baseRisk, rng, deadlineDay })
 }
 
 /**
@@ -292,53 +299,223 @@ function buildFeasibleOrder(
  *   rovers, feasible for >= 1). If two rovers share the top capacity no fair
  *   challenge exists, so it returns null.
  */
-function buildChallengeOrder(
+/** Stable id of the permanent "cargo too heavy" contract. */
+export const CHALLENGE_OVERLOAD_ID = 'order-challenge-overload'
+
+/**
+ * Id prefix of the PERIODIC "route needs too much energy" contract.
+ *
+ * The energy contract is a guest that reappears every third day. Its expired
+ * row stays in the database, so reusing one fixed id would collide with the
+ * next appearance (Prisma P2002 on `Order.id` — exactly the crash seen when
+ * day 5 rolled over into day 6). The concrete id is therefore scoped to the
+ * day it is generated on, see `challengeEnergyId`.
+ */
+export const CHALLENGE_ENERGY_ID = 'order-challenge-energy'
+
+/** Day-scoped id of the periodic energy contract, unique across appearances. */
+export function challengeEnergyId(day: number): string {
+  return `${CHALLENGE_ENERGY_ID}-d${day}`
+}
+
+/**
+ * Cargo of the energy contract. Light enough to fit an un-upgraded rover, so
+ * the blocker is unambiguously energy and never weight.
+ */
+export const CHALLENGE_ENERGY_WEIGHT = 30
+
+/** Kilograms added on top of the fully-upgraded fleet ceiling. */
+export const CHALLENGE_OVERLOAD_MARGIN = 10
+
+/**
+ * Deadline recognised by `resolveEndOfDay` as "never expires". Kept for callers
+ * that still build permanent challenge fixtures; the GENERATED contracts are
+ * day-scoped instead (they refresh every day so their location can rotate).
+ */
+export const CHALLENGE_DEADLINE_DAY = 999
+
+/** Day-scoped id of the "cargo too heavy" contract, unique across appearances. */
+export function challengeOverloadId(day: number): string {
+  return `${CHALLENGE_OVERLOAD_ID}-d${day}`
+}
+
+/** From this day on the number of impossible contracts becomes random (1 or 2). */
+export const IMPOSSIBLE_RANDOM_START_DAY = 4
+
+/**
+ * How many impossible contracts a given day carries:
+ * - days 1..(start-1): exactly one (the overload contract), so the early game
+ *   shows a single, stable "impossible" case;
+ * - from IMPOSSIBLE_RANDOM_START_DAY on: a seeded coin flip yields one or two,
+ *   so the second (energy) contract appears and disappears at random instead of
+ *   sitting on the board on a fixed schedule.
+ */
+export function impossibleChallengeCount(seed: string, day: number): number {
+  if (day < IMPOSSIBLE_RANDOM_START_DAY) return 1
+  return createSlotRng(seed, day, 92)() < 0.5 ? 1 : 2
+}
+
+/** Heaviest cargo the fleet could ever lift, assuming every cargo upgrade. */
+function fullyUpgradedFleetCeiling(rovers: readonly Rover[]): number {
+  return Math.max(
+    ...rovers.map(
+      (rover) =>
+        computeRoverStats(rover).capacity +
+        (MAX_UPGRADE_LEVEL - Math.min(rover.capacityLevel, MAX_UPGRADE_LEVEL)) *
+          CARGO_CAPACITY_PER_LEVEL,
+    ),
+  )
+}
+
+/**
+ * The two permanent impossible contracts (assignment requirement: "at least one
+ * scenario where the delivery is impossible").
+ *
+ * They are created ONCE, on day 1, and then live forever:
+ * - they never expire (`resolveEndOfDay` skips challenge orders), so the
+ *   scenario is always visible to a reviewer, on any day;
+ * - they do not consume the MAX_ACTIVE_ORDERS budget (see the end-day service),
+ *   so the player still receives a full batch of feasible orders every day.
+ *
+ * Each one demonstrates a DIFFERENT blocker, and both stay impossible even
+ * after every upgrade is bought:
+ * - overload: cargo 10 kg above the fully-upgraded fleet ceiling;
+ * - energy: a light 30 kg cargo routed to the farthest dark zone, where
+ *   `challengeBatteryHazard` triples the battery cost beyond any battery.
+ *
+ * Feasibility is still recomputed live from real rover stats, so nothing is
+ * hard-coded as "blocked" in the UI.
+ */
+function buildChallengeOrders(
   seed: string,
   day: number,
-  slot: number,
   sortedByDistance: readonly MoonLocation[],
   rovers: readonly Rover[],
-  rng: () => number,
-): Order | null {
-  const nearest = sortedByDistance[0]!
-  const caps = rovers.map((rover) => computeRoverStats(rover).capacity)
-  const maxCurrentCap = Math.max(...caps)
+): Order[] {
+  const farthest = sortedByDistance[sortedByDistance.length - 1]
+  if (farthest === undefined) return []
 
-  // Capacity each rover would reach after exactly one more cargo upgrade.
-  const cargoUpgradeCaps = rovers
-    .filter((rover) => rover.capacityLevel < MAX_UPGRADE_LEVEL)
-    .map((rover) => computeRoverStats(rover).capacity + CARGO_CAPACITY_PER_LEVEL)
-  const bestUpgradeCap =
-    cargoUpgradeCaps.length > 0 ? Math.max(...cargoUpgradeCaps) : 0
+  // Бассейн Айткена: the farthest dark zone, reserved for the energy contract.
+  const darkZone = [...sortedByDistance]
+    .reverse()
+    .find((item) => item.zoneType === 'dark')
+  // `darkest` is where the energy contract routes; it stays a real location
+  // (never undefined) so the record below type-checks even on dark-less maps.
+  const darkest = darkZone ?? farthest
 
-  let weight: number
-  if (bestUpgradeCap > maxCurrentCap) {
-    weight = bestUpgradeCap
-  } else {
-    const sorted = [...caps].sort((a, b) => b - a)
-    const top = sorted[0]!
-    const second = sorted[1] ?? 0
-    if (top <= second) return null
-    weight = second + 1
-  }
+  // The overload contract rotates across every zone EXCEPT the reserved dark
+  // one, so it is no longer pinned to the nearest zone (Море Ясности) forever.
+  const overloadPool =
+    darkZone === undefined
+      ? sortedByDistance
+      : sortedByDistance.filter((item) => item.id !== darkZone.id)
+  const pool = overloadPool.length > 0 ? overloadPool : sortedByDistance
+  const nearest = pool[Math.floor(createSlotRng(seed, day, 90)() * pool.length)]
+  if (nearest === undefined) return []
 
-  const baseRisk = clamp(
-    roundToInt(ORDER_BASE_RISK + day * ORDER_RISK_PER_DAY),
-    0,
-    60,
-  )
+  // Days 1..3 show exactly one impossible contract; from day 4 a seeded coin
+  // flip adds the energy contract as a random second, so it comes and goes.
+  const impossibleCount = impossibleChallengeCount(seed, day)
+  const wantsOverload = true
+  const wantsEnergy = impossibleCount >= 2 && darkZone !== undefined
 
-  return makeOrderRecord({
+  const baseRisk = clamp(roundToInt(ORDER_BASE_RISK), 0, 60)
+
+  const overload = makeOrderRecord({
     seed,
     day,
-    slot,
+    slot: 0,
     urgency: 'normal',
     location: nearest,
-    weight,
+    weight: fullyUpgradedFleetCeiling(rovers) + CHALLENGE_OVERLOAD_MARGIN,
     baseRisk,
-    rng,
+    rng: createSlotRng(seed, day, 90),
     isChallenge: true,
+    id: challengeOverloadId(day),
+    title: `Негабаритный модуль \u2192 ${nearest.name}`,
+    description:
+      'Контракт-вызов: груз тяжелее, чем сможет поднять любой ровер даже ' +
+      'после полной прокачки грузоподъёмности.',
+    // Day-scoped, so tomorrow's overload can land on a different zone.
+    deadlineDay: day,
   })
+
+  const energy = makeOrderRecord({
+    seed,
+    day,
+    slot: 1,
+    urgency: 'normal',
+    location: darkest,
+    weight: CHALLENGE_ENERGY_WEIGHT,
+    baseRisk,
+    rng: createSlotRng(seed, day, 91),
+    isChallenge: true,
+    id: challengeEnergyId(day),
+    title: `Аварийный запас \u2192 ${darkest.name}`,
+    description:
+      'Контракт-вызов: груз лёгкий, но маршрут в тёмную зону съедает больше ' +
+      'заряда, чем вмещает даже полностью прокачанная батарея.',
+    // A guest, not a fixture: it expires with the day it appeared on, so the
+    // board goes back to a single impossible order tomorrow.
+    deadlineDay: day,
+  })
+
+  const result: Order[] = []
+  if (wantsOverload) result.push(overload)
+  if (wantsEnergy) result.push(energy)
+  return result
+}
+
+/**
+ * Live urgency of an order, derived from how many days are left until its
+ * deadline. This is the single source of truth for urgency: an order carried
+ * over from a previous day becomes more urgent as its deadline approaches, so
+ * the label always matches the real "Срок" shown on the card.
+ * - due today (0 days left) or overdue → critical;
+ * - 1 day left → urgent;
+ * - 2+ days left → normal.
+ */
+export function deriveUrgency(
+  deadlineDay: number,
+  currentDay: number,
+): OrderUrgency {
+  const daysLeft = deadlineDay - currentDay
+  if (daysLeft <= 0) return 'critical'
+  if (daysLeft === 1) return 'urgent'
+  return 'normal'
+}
+
+/**
+ * Delivery windows for one day, as a list of per-slot lifetimes (in days).
+ *
+ * Instead of forcing "one critical per day", every new order gets its own
+ * delivery window of 1..ORDER_MAX_LIFETIME_DAYS days. The window drives urgency
+ * indirectly: an order stays on the board until its deadline and its urgency
+ * rises as that deadline approaches (see `deriveUrgency`). Because orders carry
+ * over between days, the board fills up and far fewer brand-new orders appear
+ * each morning — the daily top-up only refills the free slots.
+ *
+ * - 3 orders on the opening days, 3-4 later, so the day stays a choice;
+ * - fully deterministic for a given seed + day.
+ */
+export function planDayLifetimes(
+  seed: string,
+  day: number,
+  maxCount: number,
+): number[] {
+  const rng = createSlotRng(seed, day, 80)
+
+  // Opening days stay small and readable; later days may add a fourth offer.
+  const desired = day <= 2 ? MIN_ORDERS_PER_DAY : MIN_ORDERS_PER_DAY + (rng() < 0.6 ? 1 : 0)
+  const size = Math.max(0, Math.min(desired, maxCount))
+  if (size === 0) return []
+
+  const lifetimes: number[] = []
+  for (let slot = 0; slot < size; slot += 1) {
+    // 1..ORDER_MAX_LIFETIME_DAYS, inclusive.
+    lifetimes.push(1 + Math.floor(rng() * ORDER_MAX_LIFETIME_DAYS))
+  }
+  return lifetimes
 }
 
 /**
@@ -355,7 +532,11 @@ export function isChallengeFeasible(
   return rovers.some((rover) => {
     const stats = computeRoverStats(rover)
     if (order.weight > stats.capacity) return false
-    const batteryCost = calculateBatteryCost({ order, rover: stats, location })
+    const batteryCost = calculateBatteryCost({
+      order: { weight: order.weight, isChallenge: true },
+      rover: stats,
+      location,
+    })
     return batteryCost <= stats.batteryCapacity
   })
 }
@@ -376,13 +557,13 @@ export function describeChallenge(
   if (allTooHeavy) {
     return {
       reason: `Груз ${order.weight} кг тяжелее грузоподъёмности всех доступных роверов.`,
-      hint: 'Нужно улучшить грузоподъёмность одного из роверов.',
+      hint: 'Груз превышает предел любого ровера даже при полной прокачке — заказ недостижим.',
     }
   }
 
   return {
-    reason: `Маршрут до «${location.name}» требует больше заряда, чем есть у роверов с подходящей грузоподъёмностью.`,
-    hint: 'Улучшите ёмкость или эффективность батареи либо дождитесь полной зарядки ровера.',
+    reason: `Маршрут до «${location.name}» тр��бует больше заряда, чем есть у роверов даже при полной прокачке батареи.`,
+    hint: 'Экстремальный маршрут: расход превышает даже полностью прокачанную батарею — заказ недостижим.',
   }
 }
 
@@ -401,43 +582,72 @@ export function generateDailyOrders(input: {
   rovers: readonly Rover[]
 }): Order[] {
   const { seed, day, count, locations, rovers } = input
-  if (count <= 0 || locations.length === 0 || rovers.length === 0) return []
+  // Challenge contracts still need the map and the fleet to be built, but they
+  // must NOT depend on the free daily capacity, so the empty-input guard no
+  // longer short-circuits on `count`.
+  if (locations.length === 0 || rovers.length === 0) return []
 
   const sortedByDistance = [...locations].sort(
     (a, b) => a.distance - b.distance,
   )
   const unlockedCount = unlockedLocationCount(day, sortedByDistance.length)
-  const unlocked = sortedByDistance.slice(0, unlockedCount)
-  const assignments = assignSlotLocations(day, count, unlocked.length)
+  const unlockedAll = sortedByDistance.slice(0, unlockedCount)
+
+  // Бассейн Айткена (the farthest unlocked dark zone) is reserved for the energy
+  // contract: nobody can reach it, so no REGULAR order may target it. Both the
+  // slot plan and the feasible-order builder run on the list without that zone.
+  const reservedDarkZone = [...unlockedAll]
+    .reverse()
+    .find((item) => item.zoneType === 'dark')
+  const regularLocations =
+    reservedDarkZone === undefined
+      ? unlockedAll
+      : unlockedAll.filter((item) => item.id !== reservedDarkZone.id)
+
   const orders: Order[] = []
 
-  for (let slot = 0; slot < count; slot += 1) {
-    const rng = createSlotRng(seed, day, slot)
-    const urgency = URGENCY_BY_SLOT[slot % URGENCY_BY_SLOT.length]!
-    const isChallengeSlot =
-      slot === ORDERS_PER_DAY - 1 && count === ORDERS_PER_DAY
-    // Day 1 always guarantees the challenge; later days roll for it. At most one
-    // challenge per day because only the final full-batch slot is eligible.
-    const wantsChallenge =
-      isChallengeSlot && (day === 1 || rng() < Math.min(0.3 + day * 0.1, 0.85))
-    const challenge = wantsChallenge
-      ? buildChallengeOrder(seed, day, slot, unlocked, rovers, rng)
-      : null
+  // `count` is the free capacity on the board for REGULAR orders, i.e. an upper
+  // bound. When the board is full (count <= 0) no regular order is generated,
+  // yet the impossible challenge contracts below are still created.
+  if (count > 0 && regularLocations.length > 0) {
+    // The day plan decides how many offers are worth showing and how long each
+    // one stays on the board (its delivery window in days).
+    const lifetimes = planDayLifetimes(seed, day, count)
+    const assignments = assignSlotLocations(
+      day,
+      lifetimes.length,
+      regularLocations.length,
+    )
 
-    const order =
-      challenge ??
-      buildFeasibleOrder(
-        seed,
-        day,
-        slot,
-        urgency,
-        unlocked,
-        assignments[slot]!,
-        rovers,
-        rng,
+    // Every daily slot is a feasible order. Impossible contracts are added below.
+    for (let slot = 0; slot < lifetimes.length; slot += 1) {
+      const rng = createSlotRng(seed, day, slot)
+      const deadlineDay = day + lifetimes[slot]! - 1
+      // Stored urgency mirrors the delivery window at creation (it feeds the
+      // reward multiplier). The urgency SHOWN to the player is re-derived every
+      // day from the days left, so a carried-over order ramps up over time.
+      const urgency = deriveUrgency(deadlineDay, day)
+
+      orders.push(
+        buildFeasibleOrder(
+          seed,
+          day,
+          slot,
+          urgency,
+          regularLocations,
+          assignments[slot]!,
+          rovers,
+          rng,
+          deadlineDay,
+        ),
       )
-    orders.push(order)
+    }
   }
+
+  // Impossible contracts: the always-present overload one, plus a random second
+  // (energy) one from day 4. Built over the unlocked zones regardless of
+  // `count`, so a full board can never hide the "delivery is impossible" case.
+  orders.push(...buildChallengeOrders(seed, day, unlockedAll, rovers))
 
   return orders
 }

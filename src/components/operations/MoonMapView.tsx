@@ -24,6 +24,7 @@
  * the constant is `null` (default) no network request is made at runtime.
  */
 
+import { useEffect, useRef, useState } from 'react'
 import type {
   ActiveDeliveryDto,
   GameStateDto,
@@ -204,19 +205,6 @@ const DECOR_CRATERS: ReadonlyArray<
   [150, 176, 7, 6, 0],
   [372, 300, 13, 15, -14],
   [70, 320, 10, 9, 8],
-]
-
-/** A dense, natural-looking cluster (the “crater field”), viewBox space. */
-const CRATER_FIELD: ReadonlyArray<readonly [number, number, number]> = [
-  [186, 150, 6],
-  [200, 143, 3.5],
-  [176, 138, 4.5],
-  [208, 158, 3],
-  [193, 163, 2.8],
-  [170, 152, 3.2],
-  [214, 147, 3.6],
-  [180, 165, 2.4],
-  [198, 132, 2.6],
 ]
 
 function Crater({
@@ -554,15 +542,58 @@ export function MoonMapView({
       ? controlPoint(base, displayXY(selectedLocation))
       : null
 
+  // Live container size, so the SVG viewBox can match the stage's real aspect
+  // ratio and fill it edge to edge (no letterbox bars) at any window size.
+  const stageRef = useRef<HTMLElement | null>(null)
+  const [stageSize, setStageSize] = useState<{ w: number; h: number }>({
+    w: VIEWBOX,
+    h: VIEWBOX,
+  })
+  useEffect(() => {
+    const el = stageRef.current
+    if (el === null) return
+    const measure = (): void =>
+      setStageSize({ w: el.clientWidth, h: el.clientHeight })
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  /*
+   * Responsive viewBox.
+   *
+   * A fixed square viewBox forced `preserveAspectRatio` to letterbox the square
+   * map inside the wide operations stage — the dark bars on the left and right.
+   * Instead we size the viewBox to the container's real aspect ratio and centre
+   * it on the middle of the map. The GAME_SPAN (base + every station) is always
+   * inside the viewBox, so nothing is ever cropped; the extra width/height is
+   * filled with decorative lunar surface rather than bars.
+   */
+  const aspect = stageSize.h > 0 ? stageSize.w / stageSize.h : 1
+  const GAME_SPAN = VIEWBOX - GAME_OFFSET * 2
+  const CENTER = VIEWBOX / 2
+  const vbW = aspect >= 1 ? GAME_SPAN * aspect : GAME_SPAN
+  const vbH = aspect >= 1 ? GAME_SPAN : GAME_SPAN / aspect
+  const vbX = CENTER - vbW / 2
+  const vbY = CENTER - vbH / 2
+
   return (
     <section
+      ref={stageRef}
       aria-label="Карта"
       className="relative h-full w-full overflow-hidden rounded-lg border border-border"
+      style={{ background: 'oklch(0.16 0.006 250)' }}
     >
       <svg
-        viewBox={`0 0 ${VIEWBOX} ${VIEWBOX}`}
+        viewBox={`${vbX} ${vbY} ${vbW} ${vbH}`}
         className="h-full w-full"
-        preserveAspectRatio="xMidYMid slice"
+        /*
+         * The viewBox matches the container's aspect ratio (computed above), so
+         * the map always fills the whole stage. `meet` keeps the units square
+         * (no distortion); with a matched aspect ratio it no longer adds bars.
+         */
+        preserveAspectRatio="xMidYMid meet"
         role="img"
         aria-label="Карта поверхности Луны с базой, станциями и активными маршрутами"
       >
@@ -597,28 +628,28 @@ export function MoonMapView({
             photo paints), then either the real lunar photo or the procedural
             gradient surface as the fallback. */}
         <rect
-          x={0}
-          y={0}
-          width={VIEWBOX}
-          height={VIEWBOX}
+          x={vbX}
+          y={vbY}
+          width={vbW}
+          height={vbH}
           fill={HAS_PHOTO ? 'oklch(0.14 0.01 260)' : 'url(#mcc-surface)'}
         />
         {LUNAR_SURFACE_SRC !== null ? (
           <>
             <image
               href={LUNAR_SURFACE_SRC}
-              x={0}
-              y={0}
-              width={VIEWBOX}
-              height={VIEWBOX}
+              x={vbX}
+              y={vbY}
+              width={vbW}
+              height={vbH}
               preserveAspectRatio="xMidYMid slice"
             />
             {/* static dark layer: enough opacity for readable white text */}
             <rect
-              x={0}
-              y={0}
-              width={VIEWBOX}
-              height={VIEWBOX}
+              x={vbX}
+              y={vbY}
+              width={vbW}
+              height={vbH}
               fill="oklch(0 0 0)"
               opacity={0.42}
             />
@@ -681,7 +712,7 @@ export function MoonMapView({
         </g>
 
         {/* soft edge vignette for label readability */}
-        <rect x={0} y={0} width={VIEWBOX} height={VIEWBOX} fill="url(#mcc-vignette)" />
+        <rect x={vbX} y={vbY} width={vbW} height={vbH} fill="url(#mcc-vignette)" />
 
         {/* ===== Game content (base, routes, rovers, stations) ===== */}
         <g transform={`translate(${GAME_OFFSET} ${GAME_OFFSET})`}>

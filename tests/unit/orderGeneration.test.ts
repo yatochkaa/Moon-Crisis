@@ -4,20 +4,31 @@ import {
   MAX_OPERATIONS_PER_DAY,
   MAX_RISK_PERCENT,
   MAX_UPGRADE_LEVEL,
+  MIN_ORDERS_PER_DAY,
   ORDERS_PER_DAY,
-  ORDER_LIFETIME_DAYS,
+  ORDER_MAX_LIFETIME_DAYS,
+  REQUIRED_OPERATIONS_PER_DAY,
 } from '../../src/domain/constants'
+import { calculateBatteryCost } from '../../src/domain/calculations'
 import {
+  CHALLENGE_ENERGY_ID,
+  CHALLENGE_OVERLOAD_ID,
+  IMPOSSIBLE_RANDOM_START_DAY,
   assignSlotLocations,
+  challengeEnergyId,
+  challengeOverloadId,
   calculateOrderReward,
   createSlotRng,
+  deriveUrgency,
   generateDailyOrders,
+  impossibleChallengeCount,
   isOrderFeasible,
+  planDayLifetimes,
   unlockedLocationCount,
 } from '../../src/domain/orderGeneration'
 import { computeRoverStats } from '../../src/domain/roverStats'
 import { clamp } from '../../src/domain/math'
-import type { Rover } from '../../src/domain/types'
+import type { Order, Rover } from '../../src/domain/types'
 import { SEED_LOCATIONS, SEED_ROVERS } from '../../prisma/seedData'
 
 const SEED = 'session-seed'
@@ -37,6 +48,18 @@ function locationById(id: string) {
   if (found === undefined) throw new Error(`Unknown location ${id}`)
   return found
 }
+
+/**
+ * The strongest fleet the game can ever reach: every cargo, battery and
+ * efficiency upgrade bought. Used to prove the challenge contracts stay
+ * impossible forever and are not just "expensive right now".
+ */
+const MAXED_FLEET: readonly Rover[] = SEED_ROVERS.map((rover) => ({
+  ...rover,
+  capacityLevel: MAX_UPGRADE_LEVEL,
+  batteryLevel: MAX_UPGRADE_LEVEL,
+  efficiencyLevel: MAX_UPGRADE_LEVEL,
+}))
 
 describe('createSlotRng', () => {
   it('is deterministic for the same seed + day + slot and varies otherwise', () => {
@@ -68,13 +91,14 @@ describe('generateDailyOrders determinism (req 10)', () => {
   })
 
   it('uses stable ids keyed by day and slot', () => {
-    const orders = generate(3)
-    expect(orders.map((order) => order.id)).toEqual([
-      'order-d3-s0',
-      'order-d3-s1',
-      'order-d3-s2',
-      'order-d3-s3',
-    ])
+    // Day 3 is a challenge day, so the board is regular orders + one impossible
+    // contract. Regular orders carry the stable `order-d<day>-s<slot>` id; the
+    // challenge has its own dedicated id (covered by the feasibility tests).
+    const daily = generate(3).filter((order) => !order.isChallenge)
+    expect(daily.length).toBeGreaterThanOrEqual(MIN_ORDERS_PER_DAY)
+    expect(daily.map((order) => order.id)).toEqual(
+      daily.map((_order, slot) => `order-d3-s${slot}`),
+    )
   })
 
   it('returns nothing without locations or rovers', () => {
@@ -91,72 +115,143 @@ describe('generateDailyOrders determinism (req 10)', () => {
 })
 
 describe('feasibility guarantees (req 11)', () => {
-  it('every day has at least two feasible and at most one challenge (infeasible) order', () => {
+  it('offers only feasible daily orders and drip-feeds the impossible ones', () => {
     for (let day = 1; day <= 12; day += 1) {
       const orders = generate(day)
-      const feasible = orders.filter((order) =>
+      const daily = orders.filter((order) => !order.isChallenge)
+      const challenges = orders.filter((order) => order.isChallenge)
+
+      const feasible = daily.filter((order) =>
         isOrderFeasible(order, locationById(order.locationId), SEED_ROVERS),
       )
-      const infeasible = orders.length - feasible.length
-      const challenges = orders.filter((order) => order.isChallenge).length
 
-      expect(feasible.length).toBeGreaterThanOrEqual(2)
-      expect(infeasible).toBeLessThanOrEqual(1)
-      expect(challenges).toBeLessThanOrEqual(1)
+      // Every regular order of the day must be doable by the starting fleet.
+      expect(feasible).toHaveLength(daily.length)
+      expect(feasible.length).toBeGreaterThanOrEqual(MIN_ORDERS_PER_DAY)
+
+      // Days 1..3 carry one impossible contract; from day 4 a seeded coin flip
+      // makes it one or two, so the count breathes without a fixed schedule.
+      expect(challenges).toHaveLength(impossibleChallengeCount(SEED, day))
     }
   })
 
-  it('guarantees a day-1 challenge, infeasible now but unlocked by ONE cargo upgrade', () => {
-    const challenge = generate(1).find((order) => order.isChallenge)
-    expect(challenge).toBeDefined()
-    if (challenge === undefined) return
-
-    const location = locationById(challenge.locationId)
-    // Infeasible for the starting fleet (heavier than every current capacity).
-    expect(isOrderFeasible(challenge, location, SEED_ROVERS)).toBe(false)
-
-    // One cargo upgrade on the cargo rover makes it feasible.
-    const upgraded: Rover[] = SEED_ROVERS.map((rover) =>
-      rover.id === 'rover-cargo-02'
-        ? { ...rover, capacityLevel: 1 }
-        : { ...rover },
-    )
-    expect(isOrderFeasible(challenge, location, upgraded)).toBe(true)
+  it('shows exactly one impossible (overload) contract on days 1-3', () => {
+    for (const day of [1, 2, 3]) {
+      const challenges = generate(day).filter((order) => order.isChallenge)
+      // A single, day-scoped overload contract: the id carries the day so a
+      // fresh one never collides with yesterday's expired row (Prisma P2002).
+      expect(challenges.map((order) => order.id)).toEqual([
+        challengeOverloadId(day),
+      ])
+      expect(challenges[0]!.id.startsWith(CHALLENGE_OVERLOAD_ID)).toBe(true)
+      // Day-scoped: it leaves the board tomorrow and regenerates elsewhere.
+      expect(challenges[0]!.deadlineDay).toBe(day)
+      expect(
+        isOrderFeasible(
+          challenges[0]!,
+          locationById(challenges[0]!.locationId),
+          SEED_ROVERS,
+        ),
+      ).toBe(false)
+    }
   })
 
-  it('never sets a challenge above the fully-upgraded fleet maximum', () => {
-    const challenge = generate(1).find((order) => order.isChallenge)
-    expect(challenge).toBeDefined()
-    if (challenge === undefined) return
+  it('adds the energy contract only from day 4, as the random second one', () => {
+    // Before day 4 there is never a second (energy) contract.
+    for (const day of [1, 2, 3]) {
+      const challenges = generate(day).filter((order) => order.isChallenge)
+      expect(challenges).toHaveLength(1)
+      expect(challenges[0]!.id).toBe(challengeOverloadId(day))
+    }
 
-    const maxedFleet: Rover[] = SEED_ROVERS.map((rover) => ({
-      ...rover,
-      capacityLevel: MAX_UPGRADE_LEVEL,
-    }))
-    const absoluteMax = Math.max(
-      ...maxedFleet.map((rover) => computeRoverStats(rover).capacity),
-    )
-    expect(challenge.weight).toBeLessThanOrEqual(absoluteMax)
+    // From day 4 the count is a seeded 1-or-2. When it is 2 the extra contract
+    // is the energy guest: routed to a dark zone and expiring the same day.
+    let sawOne = false
+    let sawTwo = false
+    for (let day = IMPOSSIBLE_RANDOM_START_DAY; day <= 40; day += 1) {
+      const challenges = generate(day).filter((order) => order.isChallenge)
+      expect(challenges).toHaveLength(impossibleChallengeCount(SEED, day))
+      if (challenges.length === 2) {
+        sawTwo = true
+        const energy = challenges.find(
+          (order) => order.id === challengeEnergyId(day),
+        )
+        expect(energy, `energy contract on day ${day}`).toBeDefined()
+        expect(energy!.id.startsWith(CHALLENGE_ENERGY_ID)).toBe(true)
+        expect(energy!.deadlineDay).toBe(day)
+        expect(locationById(energy!.locationId).zoneType).toBe('dark')
+      } else {
+        sawOne = true
+        expect(challenges[0]!.id).toBe(challengeOverloadId(day))
+      }
+    }
+    // The coin flip must produce both outcomes across the long window.
+    expect(sawOne).toBe(true)
+    expect(sawTwo).toBe(true)
   })
 
-  it('gives a fully-maxed fleet a role-specific challenge only one rover can take', () => {
-    const maxedFleet: Rover[] = SEED_ROVERS.map((rover) => ({
-      ...rover,
-      capacityLevel: MAX_UPGRADE_LEVEL,
-    }))
-    const challenge = generate(1, ORDERS_PER_DAY, maxedFleet).find(
-      (order) => order.isChallenge,
+  it('keeps every impossible contract impossible even for a fully upgraded fleet', () => {
+    const challenges: Order[] = []
+    for (let day = 1; day <= 40; day += 1) {
+      for (const order of generate(day, ORDERS_PER_DAY, MAXED_FLEET)) {
+        if (order.isChallenge) challenges.push(order)
+      }
+    }
+    // The window must have produced both kinds of impossible contract.
+    expect(
+      challenges.some((order) => order.id.startsWith(CHALLENGE_OVERLOAD_ID)),
+    ).toBe(true)
+    expect(
+      challenges.some((order) => order.id.startsWith(CHALLENGE_ENERGY_ID)),
+    ).toBe(true)
+
+    for (const order of challenges) {
+      const location = locationById(order.locationId)
+      expect(isOrderFeasible(order, location, MAXED_FLEET)).toBe(false)
+
+      // Not a single rover of the maxed fleet can take it, ever.
+      const feasibleCount = MAXED_FLEET.filter((rover) =>
+        isOrderFeasible(order, location, [rover]),
+      ).length
+      expect(feasibleCount).toBe(0)
+    }
+  })
+
+  it('blocks one contract by cargo weight and the other by battery', () => {
+    const orders: Order[] = []
+    for (let day = 1; day <= 40; day += 1) {
+      orders.push(...generate(day, ORDERS_PER_DAY, MAXED_FLEET))
+    }
+    const overload = orders.find((order) =>
+      order.id.startsWith(CHALLENGE_OVERLOAD_ID),
     )
-    expect(challenge).toBeDefined()
-    if (challenge === undefined) return
+    const energy = orders.find((order) =>
+      order.id.startsWith(CHALLENGE_ENERGY_ID),
+    )
+    expect(overload).toBeDefined()
+    expect(energy).toBeDefined()
+    if (overload === undefined || energy === undefined) return
 
-    const location = locationById(challenge.locationId)
-    const feasibleCount = maxedFleet.filter((rover) =>
-      isOrderFeasible(challenge, location, [rover]),
-    ).length
+    const maxCapacity = Math.max(
+      ...MAXED_FLEET.map((rover) => computeRoverStats(rover).capacity),
+    )
 
-    // Feasible for exactly one specialised rover => impossible for >= 2 rovers.
-    expect(feasibleCount).toBe(1)
+    // Overload contract: heavier than anything the fleet will ever lift.
+    expect(overload.weight).toBeGreaterThan(maxCapacity)
+
+    // Energy contract: light enough to load, blocked purely by the route.
+    expect(energy.weight).toBeLessThanOrEqual(maxCapacity)
+    const location = locationById(energy.locationId)
+    expect(location.zoneType).toBe('dark')
+    for (const rover of MAXED_FLEET) {
+      const stats = computeRoverStats(rover)
+      const cost = calculateBatteryCost({
+        order: { weight: energy.weight, isChallenge: energy.isChallenge },
+        rover: stats,
+        location,
+      })
+      expect(cost).toBeGreaterThan(stats.batteryCapacity)
+    }
   })
 })
 
@@ -217,30 +312,99 @@ describe('reward is derived, not random (req 12)', () => {
   })
 })
 
-describe('order lifetime by urgency (req 8)', () => {
-  it('sets the deadline from the urgency lifetime', () => {
-    for (let day = 1; day <= 4; day += 1) {
-      for (const order of generate(day)) {
-        expect(order.deadlineDay).toBe(
-          day + ORDER_LIFETIME_DAYS[order.urgency] - 1,
-        )
-      }
-      // Critical orders live a single day: they expire the same day.
+describe('order lifetime and derived urgency (req 8)', () => {
+  it('gives every regular order a 1..ORDER_MAX_LIFETIME_DAYS delivery window', () => {
+    for (let day = 1; day <= 8; day += 1) {
       for (const order of generate(day).filter(
-        (candidate) => candidate.urgency === 'critical',
+        (candidate) => !candidate.isChallenge,
       )) {
-        expect(order.deadlineDay).toBe(day)
+        const lifetime = order.deadlineDay - day + 1
+        expect(lifetime).toBeGreaterThanOrEqual(1)
+        expect(lifetime).toBeLessThanOrEqual(ORDER_MAX_LIFETIME_DAYS)
       }
     }
+  })
+
+  it('stores an urgency that matches the days left at creation', () => {
+    for (let day = 1; day <= 8; day += 1) {
+      for (const order of generate(day).filter(
+        (candidate) => !candidate.isChallenge,
+      )) {
+        expect(order.urgency).toBe(deriveUrgency(order.deadlineDay, day))
+      }
+    }
+  })
+
+  it('derives urgency from the days left (critical today, urgent tomorrow)', () => {
+    expect(deriveUrgency(5, 5)).toBe('critical')
+    expect(deriveUrgency(5, 6)).toBe('critical')
+    expect(deriveUrgency(6, 5)).toBe('urgent')
+    expect(deriveUrgency(7, 5)).toBe('normal')
+    expect(deriveUrgency(10, 5)).toBe('normal')
   })
 })
 
 describe('batch size', () => {
   it('never generates more than the daily quota', () => {
-    expect(generate(1)).toHaveLength(ORDERS_PER_DAY)
+    // Day 1: a small opening batch plus the permanent challenge contract.
+    expect(
+      generate(1).filter((order) => !order.isChallenge),
+    ).toHaveLength(MIN_ORDERS_PER_DAY)
+    expect(generate(1)).toHaveLength(MIN_ORDERS_PER_DAY + 1)
+    // Day 2 now also carries the day-scoped overload contract.
+    expect(
+      generate(2).filter((order) => !order.isChallenge),
+    ).toHaveLength(MIN_ORDERS_PER_DAY)
+    expect(generate(2)).toHaveLength(MIN_ORDERS_PER_DAY + 1)
+
     // The daily quota and the per-day operation cap are independent knobs.
     expect(ORDERS_PER_DAY).toBeGreaterThan(MAX_OPERATIONS_PER_DAY - 1)
+    // The player must complete every allowed operation to end a day cleanly.
+    expect(REQUIRED_OPERATIONS_PER_DAY).toBeLessThanOrEqual(MAX_OPERATIONS_PER_DAY)
+    expect(REQUIRED_OPERATIONS_PER_DAY).toBe(MAX_OPERATIONS_PER_DAY)
     expect(CARGO_CAPACITY_PER_LEVEL).toBeGreaterThan(0)
+  })
+
+  it('never exceeds the free capacity it is given', () => {
+    for (const capacity of [0, 1, 2, 3]) {
+      const daily = generate(5, capacity).filter((order) => !order.isChallenge)
+      expect(daily.length).toBeLessThanOrEqual(capacity)
+    }
+  })
+})
+
+describe('daily lifetime plan', () => {
+  it('keeps every delivery window between 1 and ORDER_MAX_LIFETIME_DAYS', () => {
+    for (let day = 1; day <= 12; day += 1) {
+      for (const lifetime of planDayLifetimes(SEED, day, ORDERS_PER_DAY)) {
+        expect(lifetime).toBeGreaterThanOrEqual(1)
+        expect(lifetime).toBeLessThanOrEqual(ORDER_MAX_LIFETIME_DAYS)
+      }
+    }
+  })
+
+  it('keeps the batch between the minimum and the daily quota', () => {
+    for (let day = 1; day <= 12; day += 1) {
+      const plan = planDayLifetimes(SEED, day, ORDERS_PER_DAY)
+      expect(plan.length).toBeGreaterThanOrEqual(MIN_ORDERS_PER_DAY)
+      expect(plan.length).toBeLessThanOrEqual(ORDERS_PER_DAY)
+    }
+  })
+
+  it('varies the delivery windows across the run', () => {
+    const windows = new Set<number>()
+    for (let day = 1; day <= 12; day += 1) {
+      for (const lifetime of planDayLifetimes(SEED, day, ORDERS_PER_DAY)) {
+        windows.add(lifetime)
+      }
+    }
+    expect(windows.size).toBeGreaterThan(1)
+  })
+
+  it('is deterministic for a given seed and day', () => {
+    expect(planDayLifetimes(SEED, 4, ORDERS_PER_DAY)).toEqual(
+      planDayLifetimes(SEED, 4, ORDERS_PER_DAY),
+    )
   })
 })
 
@@ -256,16 +420,21 @@ const STRONG_FLEET: readonly Rover[] = SEED_ROVERS.map((rover) => ({
   efficiencyLevel: MAX_UPGRADE_LEVEL,
 }))
 
-function distinctLocationCount(day: number): number {
-  const ids = generate(day, ORDERS_PER_DAY, STRONG_FLEET).map(
-    (order) => order.locationId,
+/** Daily orders only: the fixed challenge contracts are not part of the mix. */
+function dailyOrders(day: number) {
+  return generate(day, ORDERS_PER_DAY, STRONG_FLEET).filter(
+    (order) => !order.isChallenge,
   )
+}
+
+function distinctLocationCount(day: number): number {
+  const ids = dailyOrders(day).map((order) => order.locationId)
   return new Set(ids).size
 }
 
 function maxShare(day: number): number {
   const counts = new Map<string, number>()
-  for (const order of generate(day, ORDERS_PER_DAY, STRONG_FLEET)) {
+  for (const order of dailyOrders(day)) {
     counts.set(order.locationId, (counts.get(order.locationId) ?? 0) + 1)
   }
   return Math.max(...counts.values())
@@ -327,12 +496,8 @@ describe('location distribution (req 8)', () => {
 
   it('remains fully deterministic for the same seed and day', () => {
     for (const day of [1, 4, 7]) {
-      const first = generate(day, ORDERS_PER_DAY, STRONG_FLEET).map(
-        (order) => order.locationId,
-      )
-      const second = generate(day, ORDERS_PER_DAY, STRONG_FLEET).map(
-        (order) => order.locationId,
-      )
+      const first = dailyOrders(day).map((order) => order.locationId)
+      const second = dailyOrders(day).map((order) => order.locationId)
       expect(first).toEqual(second)
     }
   })

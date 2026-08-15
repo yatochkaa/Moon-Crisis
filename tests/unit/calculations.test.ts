@@ -6,7 +6,11 @@ import {
   calculateRisk,
   calculateSimulationSeconds,
 } from '../../src/domain/calculations'
-import { MAX_RISK_PERCENT, MIN_RISK_PERCENT } from '../../src/domain/constants'
+import {
+  MAX_RISK_PERCENT,
+  MIN_RISK_PERCENT,
+  MIN_SIMULATION_SECONDS,
+} from '../../src/domain/constants'
 import {
   makeCrater,
   makeDark,
@@ -118,6 +122,32 @@ describe('calculateRisk', () => {
     expect(tooLow).toBe(MIN_RISK_PERCENT)
   })
 
+  it('a safety upgrade lowers route risk and cannot lower it below zero', () => {
+    const order = makeOrder({ weight: 10, baseRisk: 20 })
+    const location = makePlain({ riskBonus: 0 })
+
+    const withoutSafety = calculateRisk({
+      order,
+      rover: { ...makeRover({ capacity: 40 }), safetyRiskReduction: 0 },
+      location,
+    })
+    const withSafety = calculateRisk({
+      order,
+      rover: { ...makeRover({ capacity: 40 }), safetyRiskReduction: 8 },
+      location,
+    })
+
+    expect(withoutSafety).toBe(23)
+    expect(withSafety).toBe(15)
+    expect(
+      calculateRisk({
+        order: makeOrder({ weight: 0, baseRisk: 1 }),
+        rover: { ...makeRover({ capacity: 40 }), safetyRiskReduction: 8 },
+        location,
+      }),
+    ).toBe(MIN_RISK_PERCENT)
+  })
+
   it('a fuller rover is riskier', () => {
     const order = makeOrder({ weight: 30, baseRisk: 10 })
     const location = makePlain()
@@ -170,5 +200,23 @@ describe('calculateSimulationSeconds', () => {
     // 20 * 4 * 1 = 80 -> clamped down to 40
     expect(calculateSimulationSeconds(20, 0)).toBe(40)
     expect(calculateSimulationSeconds(100, 0)).toBe(40)
+  })
+
+  it('still speeds up a route that hits the duration cap', () => {
+    // A very long route caps at 40s. The speed upgrade must keep cutting that
+    // capped wait, otherwise the shop sells "-20%" that renders as 40 -> 40.
+    expect(calculateSimulationSeconds(20, 0)).toBe(40)
+    expect(calculateSimulationSeconds(20, 1)).toBe(32)
+    expect(calculateSimulationSeconds(20, 2)).toBe(26)
+
+    // Every level is strictly faster than the previous one, at any distance.
+    for (const hours of [1, 3, 7, 12, 20, 100]) {
+      const level0 = calculateSimulationSeconds(hours, 0)
+      const level1 = calculateSimulationSeconds(hours, 1)
+      const level2 = calculateSimulationSeconds(hours, 2)
+      expect(level1).toBeLessThanOrEqual(level0)
+      expect(level2).toBeLessThanOrEqual(level1)
+      if (level0 > MIN_SIMULATION_SECONDS) expect(level1).toBeLessThan(level0)
+    }
   })
 })

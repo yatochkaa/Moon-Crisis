@@ -46,7 +46,7 @@ export type DeliveryRecord = {
   readonly status: DeliveryStatus
   readonly startedAt: Date
   readonly completesAt: Date
-  /** Null while a delivery is in transit; always set in iteration 1. */
+  /** Null while a delivery is in transit; set only after completion. */
   readonly result: DeliveryResult | null
   readonly idempotencyKey: string
   readonly createdAt: Date
@@ -76,10 +76,7 @@ export type CreateDeliveryInput = {
   readonly status: DeliveryStatus
   readonly startedAt: Date
   readonly completesAt: Date
-  /**
-   * Iteration 1 always resolves the delivery immediately, so this is set on
-   * creation. `null` is reserved for future `in_transit` deliveries.
-   */
+  /** Null at departure; set by completeDelivery after the server deadline. */
   readonly result: DeliveryResult | null
   readonly idempotencyKey: string
 }

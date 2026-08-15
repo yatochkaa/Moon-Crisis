@@ -128,8 +128,8 @@ export function computeBatteryAfterDelivery(
 /**
  * Applies one delivery result to the current state.
  *
- * A delivery is resolved immediately inside the same game day: the duration is
- * informational, the rover returns to `idle` and only its battery is charged.
+ * The battery was charged at departure; this applies terminal order, credit and
+ * rating effects after the server has confirmed that the delivery is complete.
  * The reward is added exactly once and only on success, to both the spendable
  * balance and the lifetime earned total.
  */

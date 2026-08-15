@@ -67,13 +67,14 @@ export async function getGameState(
     locations: locations.map(toLocationDto),
     rovers: rovers.map((rover) => toRoverDto(rover, session, explainContext)),
     orders: orders.map((order) => {
-      if (!order.isChallenge) return toOrderDto(order)
+      const day = session.currentDay
+      if (!order.isChallenge) return toOrderDto(order, day)
       const location = locationById.get(order.locationId)
-      if (location === undefined) return toOrderDto(order)
+      if (location === undefined) return toOrderDto(order, day)
       // A feasible challenge carries no blocking reason/hint, so the UI shows it
       // as available. Recomputed live, so a purchased upgrade unlocks it at once.
-      if (isChallengeFeasible(order, location, rovers)) return toOrderDto(order)
-      return toOrderDto(order, describeChallenge(order, location, rovers))
+      if (isChallengeFeasible(order, location, rovers)) return toOrderDto(order, day)
+      return toOrderDto(order, day, describeChallenge(order, location, rovers))
     }),
     events: events.map(toEventDto),
     finalResult: toFinalResultDto(session, orders, events),

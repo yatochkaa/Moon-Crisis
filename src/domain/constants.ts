@@ -53,22 +53,10 @@ export const DEFAULT_MINIMUM_RATING = 40
  */
 export const RATING_STABLE_THRESHOLD = 70
 
-/** Rating points gained after a successful delivery. */
-export const RATING_GAIN_ON_SUCCESS = 2
-
-/** Rating points lost after a failed delivery. */
-export const RATING_LOSS_ON_FAILURE = 12
-
-/** Rating points lost for every order that expires at the end of a day. */
-export const RATING_LOSS_ON_EXPIRED_ORDER = 5
-
-/** Extra rating points lost when the expired order was critical. */
-export const RATING_LOSS_ON_EXPIRED_CRITICAL_ORDER = 10
-
 /**
  * Rating change per delivery outcome, keyed by urgency (Game Design v3).
  * A success raises the rating by `success`; a failure or an expiry lowers it
- * by `failure`. These replace the flat RATING_GAIN/LOSS constants above.
+ * by `failure`.
  */
 export const RATING_DELTAS: Record<
   'normal' | 'urgent' | 'critical',
@@ -91,9 +79,6 @@ export const RANK_PLATINUM_THRESHOLD = 17000
  * Night recharge = ceil(batteryCapacity * NIGHT_RECHARGE_RATIO).
  */
 export const NIGHT_RECHARGE_RATIO = 0.5
-
-/** @deprecated Use NIGHT_RECHARGE_RATIO with batteryCapacity instead. */
-export const BATTERY_RECHARGE_PER_DAY = 40
 
 /** Number of most recent events exposed through the game state DTO. */
 export const RECENT_EVENTS_LIMIT = 12
@@ -181,11 +166,30 @@ export const CHARGE_COST_PER_UNIT = 4
 /** Orders created at reset and at the start of every new day. */
 export const ORDERS_PER_DAY = 4
 
-/** Hard cap on simultaneously active (available or in-progress) orders. */
-export const MAX_ACTIVE_ORDERS = 6
+/**
+ * Smallest daily batch. With 3 offers and 3 operations a day the player always
+ * has something to choose from, without the board turning into a backlog.
+ */
+export const MIN_ORDERS_PER_DAY = 3
 
-/** Deliveries a player may start per day. Failed deliveries also count. */
+/**
+ * Hard cap on simultaneously active (available or in-progress) orders.
+ * Permanent challenge contracts are excluded from this budget, and unfinished
+ * orders carry over to the next day, so the player usually chooses between more
+ * offers than a single day produces.
+ */
+export const MAX_ACTIVE_ORDERS = 5
+
+/** Deliveries a player MAY start per day. Failed deliveries also count. */
 export const MAX_OPERATIONS_PER_DAY = 3
+
+/**
+ * Deliveries a player MUST start per day to avoid the early-end rating penalty.
+ * Set equal to MAX_OPERATIONS_PER_DAY: the player must complete the full 3/3
+ * operations to end a day cleanly. Ending with 0/3, 1/3 or 2/3 requires an
+ * explicit confirmation and costs EARLY_END_RATING_PENALTY. Keep REQUIRED <= MAX.
+ */
+export const REQUIRED_OPERATIONS_PER_DAY = 3
 
 /** Rating lost when a day is ended early (fewer than the required operations). */
 export const EARLY_END_RATING_PENALTY = 10
@@ -196,6 +200,16 @@ export const ORDER_LIFETIME_DAYS: Record<'normal' | 'urgent' | 'critical', numbe
   urgent: 2,
   normal: 3,
 }
+
+/**
+ * Maximum delivery window (in days) a freshly generated regular order can get.
+ * New orders spawn with a 1..ORDER_MAX_LIFETIME_DAYS window and carry over from
+ * day to day until their deadline, so the board stays stable instead of being
+ * fully refreshed every morning. The displayed urgency is derived live from the
+ * days left (see `deriveUrgency`): 5 days out = normal, 1 day left = urgent,
+ * due today = critical.
+ */
+export const ORDER_MAX_LIFETIME_DAYS = 5
 
 // Reward model: reward is DERIVED from distance, weight, urgency and risk and
 // grows with the day number; it is never an independent random draw.
